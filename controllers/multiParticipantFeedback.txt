@@ -1,0 +1,194 @@
+// NEW ENDPOINT: analyzeMultiParticipant - Analyze all participants' performance
+// This is added to debateController.js
+
+exports.analyzeMultiParticipant = async (req, res) => {
+  try {
+    const { speeches, topic, participants } = req.body;
+
+    // Validate input
+    if (!speeches || !Array.isArray(speeches) || speeches.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Speeches must be a non-empty array"
+      });
+    }
+
+    if (!topic) {
+      return res.status(400).json({ success: false, error: "Topic is required" });
+    }
+
+    if (!participants || !Array.isArray(participants)) {
+      return res.status(400).json({ success: false, error: "Participants list is required" });
+    }
+
+    const nvidiaApiKey = process.env.NVIDIA_API_KEY;
+    const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
+    const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
+
+    // Group speeches by participant
+    const speechesByParticipant = {};
+    participants.forEach(p => {
+      speechesByParticipant[p.userId] = {
+        playerName: p.playerName,
+        speeches: speeches.filter(s => s.userId === p.userId || s.speaker === p.playerName),
+        totalPoints: 0,
+        totalWords: 0
+      };
+    });
+
+    // Calculate stats per participant
+    Object.values(speechesByParticipant).forEach(participant => {
+      participant.speeches.forEach(speech => {
+        participant.totalPoints += (speech.points || 0);
+        participant.totalWords += (speech.text?.split(' ').length || 0);
+      });
+    });
+
+    // Create debate transcript with all speakers
+    const debateTranscript = speeches
+      .map((s, idx) => {
+        return `${s.playerName} (Turn ${idx + 1}): ${s.text}`;
+      })
+      .join("\n\n");
+
+    // Create participant comparison table
+    const participantSummary = Object.entries(speechesByParticipant)
+      .map(([userId, data]) => `${data.playerName}: ${data.speeches.length} speeches, ${data.totalWords} words, ${data.totalPoints} points`)
+      .join("\n");
+
+    const multiParticipantPrompt = `You are a debate judge and coach analyzing a debate between multiple participants.
+
+DEBATE TOPIC: "${topic}"
+
+PARTICIPANTS: 
+${participantSummary}
+
+COMPLETE DEBATE TRANSCRIPT:
+${debateTranscript}
+
+---
+
+Analyze each participant's performance and provide feedback for each one. Focus on:
+1. How well they explained their ideas
+2. Whether they responded to other people's points
+3. The quality and clarity of their arguments
+4. How respectful and engaged they were
+
+Provide feedback in this JSON structure:
+
+{
+  "topic": "${topic}",
+  "participantFeedback": [
+    {
+      "playerName": "<name>",
+      "overallScore": <1-10>,
+      "summary": "<1-2 sentences about their performance>",
+      "strength": "<what they did well>",
+      "improvement": "<what they can work on>",
+      "advice": "<specific tip for next time>"
+    },
+    // ... one entry per participant
+  ],
+  "debateHighlights": {
+    "bestArgument": "<describe the best argument made>",
+    "bestResponseToPoint": "<describe the best counter-argument>",
+    "mostEngaged": "<name of most active participant>"
+  },
+  "topicInsights": "<what different sides were presented on this topic>"
+}
+
+Keep feedback simple and encouraging. Return ONLY valid JSON.`;
+
+    try {
+      if (nvidiaApiKey) {
+        console.log('[analyzeMultiParticipant] ✅ Using NVIDIA LLM for multi-participant analysis');
+        
+        // Construct proper endpoint URL
+        const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
+        
+        const nvidiaResponse = await axios.post(
+          endpoint,
+          {
+            model: nvidiaModel,
+            messages: [
+              {
+                role: 'system',
+                content: `You are a fair and encouraging debate judge. You analyze all participants fairly and constructively. You provide simple, actionable feedback that helps everyone improve. Keep feedback brief but meaningful.`
+              },
+              {
+                role: 'user',
+                content: multiParticipantPrompt
+              }
+            ],
+            max_tokens: 2000,
+            temperature: 0.7,
+            top_p: 0.95
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${nvidiaApiKey}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 30000
+          }
+        );
+
+        const analysisText = nvidiaResponse.data?.choices?.[0]?.message?.content;
+        console.log('[analyzeMultiParticipant] ✅ NVIDIA Response received');
+
+        if (!analysisText) {
+          throw new Error('No analysis text from NVIDIA');
+        }
+
+        // Parse JSON response
+        let analysis = JSON.parse(analysisText);
+        
+        res.json({ 
+          success: true, 
+          analysis,
+          source: 'NVIDIA_LLM',
+          timestamp: new Date().toISOString(),
+          totalParticipants: participants.length,
+          totalSpeeches: speeches.length
+        });
+      } else {
+        throw new Error('NVIDIA API key not configured');
+      }
+    } catch (llmError) {
+      console.error('[analyzeMultiParticipant] ❌ LLM FAILED:', llmError.message);
+      
+      // Return fallback structured data
+      const fallbackAnalysis = {
+        topic: topic,
+        participantFeedback: Object.entries(speechesByParticipant).map(([userId, data]) => ({
+          playerName: data.playerName,
+          overallScore: 6,
+          summary: `Good participation in the debate with ${data.speeches.length} speeches.`,
+          strength: "Showed interest in the topic and participated actively",
+          improvement: "Could provide more examples and specific reasons",
+          advice: "Try to respond directly to what others say"
+        })),
+        debateHighlights: {
+          bestArgument: "Participants shared interesting perspectives",
+          bestResponseToPoint: "Good attempts at counter-arguments",
+          mostEngaged: speechesByParticipant[Object.keys(speechesByParticipant)[0]]?.playerName || "Participant"
+        },
+        topicInsights: `Debate covered multiple viewpoints on "${topic}"`
+      };
+
+      res.json({ 
+        success: true, 
+        analysis: fallbackAnalysis,
+        source: 'FALLBACK_TEMPLATE',
+        warning: '⚠️ This is template feedback. LLM analysis temporarily unavailable.',
+        timestamp: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    console.error('[analyzeMultiParticipant] Error:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message
+    });
+  }
+};
