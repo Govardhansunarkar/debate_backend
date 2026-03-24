@@ -19,10 +19,16 @@ const corsOrigins = [
 
 // Add production domains
 if (process.env.FRONTEND_URL) {
-  corsOrigins.push(process.env.FRONTEND_URL);
+  corsOrigins.push(process.env.FRONTEND_URL.trim());
 }
 
-console.log('🔐 CORS Origins:', corsOrigins);
+// Add local URL from env if exists
+if (process.env.FRONTEND_URL_LOCAL) {
+  corsOrigins.push(process.env.FRONTEND_URL_LOCAL.trim());
+}
+
+console.log('🔐 CORS Origins Configured:', corsOrigins);
+console.log('🔐 NODE_ENV:', process.env.NODE_ENV);
 
 // Socket.IO configuration
 const io = socketIo(server, {
@@ -38,11 +44,21 @@ const io = socketIo(server, {
   upgradeTimeout: 10000
 });
 
-// Middleware
+// Middleware - ORDER MATTERS: CORS first
 app.use(cors({
-  origin: corsOrigins,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin || corsOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn('❌ CORS rejected origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 app.use(express.json());
 
