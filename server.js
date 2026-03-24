@@ -14,10 +14,13 @@ const corsOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
-  'http://127.0.0.1:3000'
+  'http://127.0.0.1:3000',
+  // Production URLs (hardcoded fallback)
+  'https://debate-frontend-one.vercel.app',
+  'https://debate-frontend-paro.vercel.app'
 ];
 
-// Add production domains
+// Add production domains from env
 if (process.env.FRONTEND_URL) {
   corsOrigins.push(process.env.FRONTEND_URL.trim());
 }
