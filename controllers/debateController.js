@@ -338,26 +338,26 @@ SCORING EXAMPLES:
 - Score 1-2: Very unclear + no examples + ignored opponent + no logic + very hard to follow
 
 Return ONLY valid JSON, no markdown or extra text.`;
+    if (!nvidiaApiKey) {
+      throw new Error('NVIDIA API key not configured');
+    }
 
-
-    try {
-      if (nvidiaApiKey) {
-        // Use NVIDIA LLM for analysis
-        console.log('[analyzeWithOpenAI] ✅ Using NVIDIA LLM for feedback analysis');
-        
-        // Construct proper endpoint URL
-        const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
-        console.log('[analyzeWithOpenAI] 📍 Calling endpoint:', endpoint);
-        
-        const nvidiaResponse = await axios.post(
-          endpoint,
+    // Use NVIDIA LLM for analysis
+    console.log('[analyzeWithOpenAI] ✅ Using NVIDIA LLM for feedback analysis');
+    
+    // Construct proper endpoint URL
+    const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
+    console.log('[analyzeWithOpenAI] 📍 Calling endpoint:', endpoint);
+    
+    const nvidiaResponse = await axios.post(
+      endpoint,
+      {
+        model: nvidiaModel,
+        messages: [
           {
-            model: nvidiaModel,
-            messages: [
-              {
-                role: 'system',
-                content: `You are a friendly and encouraging debate coach. You help beginner debaters by giving simple, easy-to-understand feedback and keep response in 2-3 lines only. 
-                
+            role: 'system',
+            content: `You are a friendly and encouraging debate coach. You help beginner debaters by giving simple, easy-to-understand feedback and keep response in 2-3 lines only. 
+            
 You explain things clearly without using confusing terms. Your goal is to:
 1. Make the person feel good about what they did well
 2. Give them specific, easy tips to improve
@@ -365,55 +365,58 @@ You explain things clearly without using confusing terms. Your goal is to:
 4. Be encouraging and supportive
 
 Remember: You're talking to beginners, so keep it simple and friendly!`
-              },
-              {
-                role: 'user',
-                content: feedbackPrompt
-              }
-            ],
-            max_tokens: 1500,
-            temperature: 0.7,
-            top_p: 0.95
           },
           {
-            headers: {
-              'Authorization': `Bearer ${nvidiaApiKey}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 0  // No timeout - wait for NVIDIA
+            role: 'user',
+            content: feedbackPrompt
           }
-        );
-
-        const analysisText = nvidiaResponse.data?.choices?.[0]?.message?.content;
-        console.log('[analyzeWithOpenAI] ✅ NVIDIA Response received (length:', analysisText?.length, 'chars)');
-        console.log('[analyzeWithOpenAI] Response sample:', analysisText?.substring(0, 150));
-
-        if (!analysisText) {
-          throw new Error('No analysis text from NVIDIA');
-        }
-
-        // Parse JSON response
-        let analysis = JSON.parse(analysisText);
-        console.log('[analyzeWithOpenAI] ✅ JSON parsed successfully. Score:', analysis.overall_score);
-        
-        res.json({ 
-          success: true, 
-          analysis,
-          source: 'NVIDIA_LLM',
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        throw new Error('NVIDIA API key not configured');
+        ],
+        max_tokens: 1500,
+        temperature: 0.7,
+        top_p: 0.95
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${nvidiaApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 0  // No timeout - wait for NVIDIA
       }
+    );
 
-  } catch (error) {
-    console.error('[analyzeWithOpenAI] Error:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message,
-      source: 'ERROR'
+    const analysisText = nvidiaResponse.data?.choices?.[0]?.message?.content;
+    console.log('[analyzeWithOpenAI] ✅ NVIDIA Response received (length:', analysisText?.length, 'chars)');
+    console.log('[analyzeWithOpenAI] Response sample:', analysisText?.substring(0, 150));
+
+    if (!analysisText) {
+      throw new Error('No analysis text from NVIDIA');
+    }
+
+    // Parse JSON response
+    let analysis = JSON.parse(analysisText);
+    console.log('[analyzeWithOpenAI] ✅ JSON parsed successfully. Score:', analysis.overall_score);
+    
+    res.json({ 
+      success: true, 
+      analysis,
+      source: 'NVIDIA_LLM',
+      timestamp: new Date().toISOString()
     });
-  }
+    } catch (error) {
+      console.error('[analyzeWithOpenAI] ❌ NVIDIA LLM FAILED:', error.message);
+      console.error('[analyzeWithOpenAI] Error details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        errorData: error.response?.data
+      });
+      
+      // No fallback - always fail if NVIDIA doesn't work
+      res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        source: 'NVIDIA_ERROR'
+      });
+    }
 };
 
 // Analyze debate with Gemini (also uses NVIDIA LLM for consistency)
