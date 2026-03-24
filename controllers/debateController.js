@@ -8,14 +8,21 @@ const { calculateQualityBasedPoints } = require('../utils/advancedScoringSystem'
 // =====================================================
 const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
   try {
-    console.log('[NVIDIA] Calling API with model:', model);
+    console.log('[NVIDIA] ===== NVIDIA API CALL START =====');
+    console.log('[NVIDIA] Model:', model);
+    console.log('[NVIDIA] API Key provided:', apiKey ? `yes (${apiKey.substring(0, 20)}...)` : 'NO - MISSING!');
+    console.log('[NVIDIA] API URL:', apiUrl);
+    
+    if (!apiKey) {
+      throw new Error('NVIDIA_API_KEY is not set in environment variables');
+    }
     
     // Ensure we have the full endpoint URL
     const endpoint = apiUrl.includes('/chat/completions') 
       ? apiUrl 
       : (apiUrl.replace(/\/$/, '') + '/chat/completions');
     
-    console.log('[NVIDIA] Using endpoint:', endpoint);
+    console.log('[NVIDIA] Full endpoint:', endpoint);
     
     const requestBody = {
       model: model,
@@ -29,10 +36,12 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           content: prompt 
         }
       ],
-      max_tokens: 800,  // Reduced from 1000
-      temperature: 0.65,  // Reduced from 0.7 for faster generation
-      top_p: 0.90  // Reduced from 0.95
+      max_tokens: 800,
+      temperature: 0.65,
+      top_p: 0.90
     };
+    
+    console.log('[NVIDIA] Sending request...');
     
     const response = await axios.post(
       endpoint,
@@ -42,33 +51,44 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 12000  // Reduced from 30000 to 12 seconds
+        timeout: 0  // No timeout - NVIDIA will respond whenever it's ready
       }
     );
 
-    console.log('[NVIDIA] Response status:', response.status);
+    console.log('[NVIDIA] ✅ Response status:', response.status);
     
     // Extract the message content from the response
     let aiResponse = '';
     if (response.data?.choices?.[0]?.message) {
-      // Handle different response formats
       const message = response.data.choices[0].message;
       aiResponse = (message.content || message.text || JSON.stringify(message)).trim();
     }
     
     if (!aiResponse || aiResponse.startsWith('{')) {
-      console.error('[NVIDIA] Parsing error. Message object:', response.data?.choices?.[0]?.message);
+      console.error('[NVIDIA] ❌ Parsing error. Message object:', response.data?.choices?.[0]?.message);
       throw new Error('Could not parse NVIDIA response');
     }
     
-    console.log('[NVIDIA] ✓ Response generated successfully');
+    console.log('[NVIDIA] ✅ Response received successfully');
+    console.log('[NVIDIA] ===== NVIDIA API CALL SUCCESS =====');
     return aiResponse;
   } catch (error) {
-    console.error('[NVIDIA] ⚠ API Error:', error.message);
+    console.error('[NVIDIA] ❌ ===== NVIDIA API ERROR =====');
+    console.error('[NVIDIA] Error message:', error.message);
+    console.error('[NVIDIA] Error code:', error.code);
+    
     if (error.response) {
-      console.error('[NVIDIA] Status:', error.response.status);
-      console.error('[NVIDIA] Data:', error.response.data);
+      console.error('[NVIDIA] HTTP Status:', error.response.status);
+      console.error('[NVIDIA] Status Text:', error.response.statusText);
+      console.error('[NVIDIA] Response data:', JSON.stringify(error.response.data).substring(0, 200));
+    } else if (error.request) {
+      console.error('[NVIDIA] No response received (network error)');
+      console.error('[NVIDIA] Request details:', error.request?.method, error.request?.path);
+    } else {
+      console.error('[NVIDIA] Error during request setup:', error.message);
     }
+    
+    console.error('[NVIDIA] ===== NVIDIA API FAILED =====');
     throw error;
   }
 };
@@ -360,7 +380,7 @@ Remember: You're talking to beginners, so keep it simple and friendly!`
               'Authorization': `Bearer ${nvidiaApiKey}`,
               'Content-Type': 'application/json'
             },
-            timeout: 30000
+            timeout: 0  // No timeout - wait for NVIDIA
           }
         );
 
@@ -385,190 +405,7 @@ Remember: You're talking to beginners, so keep it simple and friendly!`
       } else {
         throw new Error('NVIDIA API key not configured');
       }
-    } catch (llmError) {
-      console.error('[analyzeWithOpenAI] ❌ LLM FAILED:', llmError.message);
-      console.error('[analyzeWithOpenAI] Error details:', {
-        status: llmError.response?.status,
-        statusText: llmError.response?.statusText,
-        errorData: llmError.response?.data
-      });
-      
-      console.warn('[analyzeWithOpenAI] ⚠️ FALLING BACK TO TEMPLATE FEEDBACK (NOT GENUINE LLM)');
-      
-      // Calculate dynamic fallback grade based on debate performance
-      const userSpeeches = speeches.filter(s => s.speaker === 'user') || [];
-      const speechCount = userSpeeches.length;
-      const totalWords = userSpeeches.reduce((sum, s) => (sum + (s.text?.split(' ').length || 0)), 0);
-      const avgWordsPerSpeech = speechCount > 0 ? totalWords / speechCount : 0;
-      
-      // Analyze the actual content of speeches for better scoring
-      const speechTexts = speeches.filter(s => s.speaker === 'user').map(s => s.text || '').join(' ').toLowerCase();
-      
-      // Check for specific debate skills
-      const hasExamples = /example|like|for instance|such as/.test(speechTexts);
-      const hasQuestions = /why|how|what|when|where|\?/.test(speechTexts);
-      const isEngaging = speechCount >= 3 || totalWords > 100;
-      const ResponseLength = speechTexts.length;
-      const isDetailed = avgWordsPerSpeech > 40;
-      
-      let baseScore = 5; // Start at 5
-      
-      // Scoring based on actual performance
-      if (speechCount >= 5) baseScore += 2;
-      else if (speechCount >= 3) baseScore += 1.5;
-      else if (speechCount >= 2) baseScore += 1;
-      
-      if (isDetailed) baseScore += 1.5;
-      else if (avgWordsPerSpeech >= 25) baseScore += 0.5;
-      
-      if (hasExamples) baseScore += 1;
-      if (hasQuestions) baseScore += 0.5;
-      
-      const totalPoints = userSpeeches.reduce((sum, s) => (sum + (s.points || 0)), 0);
-      if (totalPoints >= 30) baseScore += 1.5;
-      else if (totalPoints >= 15) baseScore += 0.5;
-      
-      if (isEngaging) baseScore += 1;
-      
-      // ADD RANDOMIZATION to ensure variety between debates (±0.5 points)
-      const randomVariation = (Math.random() - 0.5) * 1.0; // Range: -0.5 to +0.5
-      const calculatedScore = Math.min(Math.max(Math.round((baseScore + randomVariation) * 10) / 10, 1), 10);
-      
-      // Generate personalized paragraph-based feedback with VARIED OPTIONS
-      let strengthsParagraph = '';
-      let improvementParagraph = '';
-      
-      // Create array of different strength options for variety
-      const strengthOptions = [
-        `You demonstrated strong participation throughout the debate with ${speechCount} contributions. Your willingness to engage multiple times shows confidence and commitment to the discussion.`,
-        `Your debate participation showed ${speechCount === 1 ? 'a solid effort with' : `consistent engagement across`} ${speechCount} ${speechCount === 1 ? 'thoughtful response' : 'different points'}. This demonstrates your ability to maintain focus.`,
-        `You actively contributed to the debate with ${speechCount} meaningful inputs, showing you were paying attention and ready to respond.`,
-        `Your involvement in the debate was notable - ${speechCount} exchanges show you're committed to exploring the topic thoroughly.`
-      ];
-      
-      // Select random strength option
-      strengthsParagraph = strengthOptions[Math.floor(Math.random() * strengthOptions.length)];
-      
-      // Add specific skill-based strengths
-      if (avgWordsPerSpeech > 50) {
-        const detailOptions = [
-          ` You elaborated thoroughly on your ideas, taking time to explain your reasoning in depth.`,
-          ` Your responses were comprehensive and well-developed, showing careful thought.`,
-          ` You provided substantive answers rather than brief comments.`
-        ];
-        strengthsParagraph += detailOptions[Math.floor(Math.random() * detailOptions.length)];
-      } else if (avgWordsPerSpeech > 25) {
-        const moderateOptions = [
-          ` You balanced being concise while still explaining your ideas adequately.`,
-          ` Your explanations were clear without being unnecessarily long.`,
-          ` You provided reasonable detail in your responses.`
-        ];
-        strengthsParagraph += moderateOptions[Math.floor(Math.random() * moderateOptions.length)];
-      }
-      
-      if (hasQuestions && hasExamples) {
-        const combinedSkillOptions = [
-          ` You both asked probing questions AND supported your points with examples - showing multi-faceted debate skills.`,
-          ` Your use of both questioning techniques and concrete examples demonstrates sophisticated debating.`,
-          ` You impressed by combining critical questions with real-world examples.`
-        ];
-        strengthsParagraph += combinedSkillOptions[Math.floor(Math.random() * combinedSkillOptions.length)];
-      } else if (hasQuestions) {
-        const questionOptions = [
-          ` Your probing questions showed critical thinking and a desire to understand the opponent's reasoning deeply.`,
-          ` By asking "why" and "how," you revealed a sharp analytical mind.`,
-          ` Your questions challenged assumptions effectively, steering the debate productively.`
-        ];
-        strengthsParagraph += questionOptions[Math.floor(Math.random() * questionOptions.length)];
-      } else if (hasExamples) {
-        const exampleOptions = [
-          ` You supported your claims with specific examples, making your arguments more convincing.`,
-          ` Using real-world examples strengthened your position substantially.`,
-          ` Your concrete examples were well-chosen and relevant to the topic.`
-        ];
-        strengthsParagraph += exampleOptions[Math.floor(Math.random() * exampleOptions.length)];
-      } else {
-        const generalOptions = [
-          ` You maintained composure and treated the debate with maturity throughout.`,
-          ` Your respectful tone helped keep the discussion constructive and civil.`,
-          ` You engaged earnestly with the arguments presented.`
-        ];
-        strengthsParagraph += generalOptions[Math.floor(Math.random() * generalOptions.length)];
-      }
-      
-      // Build improvement paragraph with VARIETY
-      const improvementOptions = [];
-      
-      if (hasExamples && !hasQuestions) {
-        improvementOptions.push(
-          `While you used examples well, try adding more critical questions to your approach. Questions like "How do you know this is true?" or "What about situations where..." will make your arguments stronger.`,
-          `You have good examples, but consider going deeper. Ask yourself "Why might my opponent disagree?" and prepare counterarguments. This strategic questioning elevates debate skills.`,
-          `Your examples are solid. Next step: Ask more probing questions to expose weaknesses in your opponent's logic before they even present them.`
-        );
-      } else if (hasQuestions && !hasExamples) {
-        improvementOptions.push(
-          `Your questions show great thinking, but back them up with evidence. Research 2-3 specific examples or statistics related to the topic to support your questioning strategy.`,
-          `Good questioning approach! Now combine it with concrete examples. Real-world cases will make your rebuttals even more powerful when challenging your opponent.`,
-          `You ask the right questions but missed an opportunity to cite specific examples. Next time, prepare some statistics or real scenarios to strengthen your position.`
-        );
-      } else if (!hasExamples && !hasQuestions) {
-        improvementOptions.push(
-          `Consider two techniques for next time: (1) Use specific real-world examples to support your points, and (2) Ask critical questions like "Why is that true?" or "How does that solve the problem?" Both will make you a stronger debater.`,
-          `To level up, add concrete examples and probing questions to your toolkit. Examples make you sound more credible; questions make you seem smarter. Use both!`,
-          `Your participation was good, but specificity matters in debates. Research the topic and come with 3 specific examples and 5 "why/how" questions prepared in advance.`
-        );
-      } else {
-        improvementOptions.push(
-          `You're already using examples and questions well! To be even stronger, try predicting your opponent's counterarguments and addressing them proactively.`,
-          `Excellent foundation with examples and questions. Now work on citing specific statistics or studies to give your arguments academic weight.`,
-          `You combined examples and questions effectively. Next challenge: Structure your arguments more logically - make it crystal clear why each point leads to your conclusion.`
-        );
-      }
-      
-      // Select random improvement option
-      improvementParagraph = improvementOptions[Math.floor(Math.random() * improvementOptions.length)];
-      
-      // Fallback to detailed paragraph-based response
-      const fallbackAnalysis = {
-        overall_score: calculatedScore,
-        summary: calculatedScore >= 7 ? "Great job! You showed solid debate skills and engagement." : calculatedScore >= 5 ? "Good effort! You participated well and showed potential." : "You participated, but there's room for improvement in your argumentation.",
-        
-        // Paragraph-style feedback instead of arrays
-        strengths_paragraph: strengthsParagraph,
-        improvement_paragraph: improvementParagraph,
-        
-        // Keep old format for compatibility
-        strengths: [
-          strengthsParagraph.slice(0, Math.min(100, strengthsParagraph.indexOf('.'))).trim() + '.',
-          hasExamples ? ('You used concrete examples: ' + (Math.random() > 0.5 ? 'real-world references make arguments stronger' : 'specificity beats general statements')) : 'You engaged with the topic directly',
-          hasQuestions ? ('Your questioning approach: ' + (Math.random() > 0.5 ? 'asking "why" reveals deeper truths' : 'critical thinking shows maturity')) : 'You participated consistently'
-        ],
-        weaknesses: [
-          `${hasExamples ? 'Strengthen arguments by citing statistics' : 'Start using concrete examples to support claims'}`,
-          `${hasQuestions ? 'Go beyond questions - include your own analysis' : 'Ask more "why" and "how" questions'}`,
-          `${avgWordsPerSpeech < 30 ? 'Elaborate more - brief answers lack depth' : 'Keep good detail while being more strategic'}`
-        ],
-        key_points: [
-          `${speechCount} participation${speechCount === 1 ? '' : 's'} (${Math.random() > 0.5 ? 'shows consistency' : 'demonstrates active engagement'})`,
-          `Avg response: ${Math.round(avgWordsPerSpeech)} words (${avgWordsPerSpeech > 40 ? 'detailed' : avgWordsPerSpeech > 20 ? 'moderate' : 'concise'})`,
-          `Approach: ${hasExamples && hasQuestions ? 'Balanced - questions + examples' : hasExamples ? 'Example-focused' : hasQuestions ? 'Question-focused' : 'Direct engagement'}`
-        ],
-        recommendations: [
-          Math.random() > 0.5 ? 'Research your topic before debating - have 3-5 facts/examples ready to mention' : 'Prepare counterarguments in advance - this gives you confidence',
-          Math.random() > 0.5 ? 'Practice pacing your responses - pause before answering to think clearly' : "Listen actively - directly address your opponent's specific points",
-          Math.random() > 0.5 ? 'Use the structure: State your point → Give evidence → Explain the impact' : 'Record yourself debating to see where you can improve delivery',
-          Math.random() > 0.5 ? 'Study debate techniques like asking clarifying questions or offering rebuttals' : "Don't just state facts - explain WHY they matter to the topic"
-        ],
-      };
-      
-      res.json({ 
-        success: true, 
-        analysis: fallbackAnalysis,
-        source: 'INTELLIGENT_FALLBACK',
-        warning: '✅ Personalized feedback based on your debate performance',
-        timestamp: new Date().toISOString()
-      });
-    }
+
   } catch (error) {
     console.error('[analyzeWithOpenAI] Error:', error.message);
     res.status(500).json({ 
@@ -694,6 +531,12 @@ exports.getAIResponse = async (req, res) => {
     const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
     const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
 
+    console.log('[getAIResponse] ===== DEBUG INFO =====');
+    console.log('[getAIResponse] NVIDIA_API_KEY set:', nvidiaApiKey ? 'YES' : 'NO');
+    console.log('[getAIResponse] NVIDIA_API_URL:', nvidiaApiUrl);
+    console.log('[getAIResponse] NVIDIA_MODEL:', nvidiaModel);
+    console.log('[getAIResponse] =====================');
+
     // Prepare debate history for context
     const conversationHistory = (debateContext && Array.isArray(debateContext))
       ? debateContext
@@ -729,25 +572,10 @@ Now give YOUR response (2-3 sentences only, no more):`;
 
     let aiResponse = null;
     let engineUsed = 'nvidia';
-    try {
-      console.log('[getAIResponse] Calling NVIDIA for response');
-      aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
-      console.log('[getAIResponse] ✓ NVIDIA response received:', aiResponse.substring(0, 100));
-    } catch (nvidiaError) {
-      console.error('[getAIResponse] NVIDIA failed:', nvidiaError.message);
-      
-      // Fallback to simple smart response if API fails
-      engineUsed = 'smart-fallback';
-      const counterarguments = [
-        `I understand your point, but I disagree. While what you said sounds right, the real issue is different. Most people miss the fact that there are other important reasons to consider.`,
-        `You make a fair point, but let me explain why I think differently. The thing you're not seeing is that in real life, things work in another way.`,
-        `That's interesting, but here's my opinion: what you said doesn't show the full picture of "${topic.toLowerCase()}". Let me tell you why it matters.`,
-        `I see what you mean, but I think you're missing something important. The real problem is that your view only looks at one side of the story.`,
-        `You're right about some things, but consider this: there's a bigger picture here that changes everything about how we should think about this topic.`
-      ];
-      
-      aiResponse = counterarguments[Math.floor(Math.random() * counterarguments.length)];
-    }
+    
+    console.log('[getAIResponse] Calling NVIDIA for response');
+    aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
+    console.log('[getAIResponse] ✓ NVIDIA response received:', aiResponse.substring(0, 100));
 
     // Calculate points based on argument QUALITY
     const scoreResult = calculateQualityBasedPoints(userArgument);
@@ -900,7 +728,7 @@ Respond with ONLY valid JSON (no markdown):
             'Authorization': `Bearer ${nvidiaApiKey}`,
             'Content-Type': 'application/json'
           },
-          timeout: 8000
+          timeout: 0  // No timeout - wait as long as NVIDIA needs
         }
       );
 
