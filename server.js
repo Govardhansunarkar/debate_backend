@@ -7,20 +7,28 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
+// Build CORS origins dynamically
+const corsOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  'http://127.0.0.1:3000'
+];
+
+// Add production domains
+if (process.env.FRONTEND_URL) {
+  corsOrigins.push(process.env.FRONTEND_URL);
+}
+
+console.log('🔐 CORS Origins:', corsOrigins);
+
 // Socket.IO configuration
 const io = socketIo(server, {
   transports: ['websocket', 'polling'],
   cors: {
-    origin: [
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://localhost:3000',
-      'http://127.0.0.1:5173',
-      'http://127.0.0.1:5174',
-      'http://127.0.0.1:3000',
-      'https://debate-frontend-one.vercel.app',
-      (process.env.FRONTEND_URL || '')
-    ],
+    origin: corsOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
     allowEIO3: true  // Allow socket.io v3 clients
@@ -32,16 +40,7 @@ const io = socketIo(server, {
 
 // Middleware
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
-    'http://127.0.0.1:3000',
-    'https://debate-frontend-one.vercel.app',
-    (process.env.FRONTEND_URL || '')
-  ],
+  origin: corsOrigins,
   credentials: true,
   optionsSuccessStatus: 200
 }));
