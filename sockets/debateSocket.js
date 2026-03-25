@@ -1,6 +1,8 @@
 module.exports = (io) => {
+  const { checkForMatch, checkForTeamMatch, addPlayerToQueue, removePlayerFromQueue } = require('../services/matchmakingService');
+  
   // Track debate rooms and their participants
-  const debateRooms = new Map(); // { debateId: { participants: Map(userId -> {playerName, socketId}), topic, roomType } }
+  const debateRooms = new Map(); // { debateId: { participants: Map(userId -> {playerName, socketId, team}), topic, roomType, teams } }
   const debateData = new Map(); // { debateId: { speeches: [], participants: Map } } - Track all speeches for each debate
   
   // Initialize or get debate data
@@ -17,23 +19,76 @@ module.exports = (io) => {
   io.on('connection', (socket) => {
     console.log('New user connected:', socket.id);
 
-    // Join matchmaking queue
+    // Join matchmaking queue for random match
     socket.on('join-queue', (data) => {
-      console.log(`${data.playerName} joined queue`);
-      // Emit match-found after 3-5 seconds (demo behavior)
-      setTimeout(() => {
-        socket.emit('match-found', {
-          debateId: `debate_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      console.log(`${data.playerName} joined queue for ${data.debateType || 'regular'}`);
+      
+      const player = {
+        userId: data.userId,
+        playerName: data.playerName,
+        socketId: socket.id,
+        topic: data.topic,
+        debateType: data.debateType || 'regular' // 'regular' or 'team'
+      };
+      
+      addPlayerToQueue(player);
+      socket.emit('queued', { position: data.position, topic: data.topic });
+      
+      // Check for team match first (priority)
+      const teamMatch = checkForTeamMatch();
+      if (teamMatch.canMatch) {
+        console.log(`🎯 Team Match Found! ${teamMatch.teamSize}`);
+        
+        const debateId = `debate_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        // Notify all matched players
+        const allTeamPlayers = [
+          ...teamMatch.teams.teamFor.players,
+          ...teamMatch.teams.teamAgainst.players
+        ];
+        
+        allTeamPlayers.forEach(player => {
+          io.to(player.socketId).emit('match-found', {
+            debateId: debateId,
+            matchType: 'team',
+            teamSize: teamMatch.teamSize,
+            topic: player.topic,
+            debateType: 'team-debate',
+            teamAssignment: 
+              teamMatch.teams.teamFor.players.some(p => p.userId === player.userId)
+                ? { teamName: 'TEAM FOR', position: 'FOR' }
+                : { teamName: 'TEAM AGAINST', position: 'AGAINST' },
+            allPlayers: allTeamPlayers.map(p => ({ userId: p.userId, playerName: p.playerName }))
+          });
         });
-      }, 3000 + Math.random() * 2000);
+        return;
+      }
+      
+      // Check for regular 1v1 match (secondary)
+      const regularMatch = checkForMatch();
+      if (regularMatch.canMatch) {
+        console.log(`✅ Regular Match Found! 1v1`);
+        
+        const debateId = `debate_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        regularMatch.players.forEach(player => {
+          io.to(player.socketId).emit('match-found', {
+            debateId: debateId,
+            matchType: 'regular',
+            topic: player.topic,
+            debateType: 'user-only'
+          });
+        });
+      }
     });
 
     // Leave matchmaking queue
     socket.on('leave-queue', (data) => {
+      removePlayerFromQueue(data.userId);
       console.log('Player left queue');
     });
 
-    // Join debate room
+    // Join debate room (for team or regular debates)
     socket.on('join-debate', (data) => {
       socket.join(data.debateId);
       
@@ -42,42 +97,77 @@ module.exports = (io) => {
         debateRooms.set(data.debateId, { 
           participants: new Map(),
           topic: data.topic || 'Debate Topic',
-          roomType: data.roomType || 'user-only'
+          roomType: data.roomType || 'user-only',
+          debateType: data.debateType || 'user-only',
+          teams: data.teams ? { // For team debates
+            teamFor: { position: 'FOR', players: data.teams.teamFor || [] },
+            teamAgainst: { position: 'AGAINST', players: data.teams.teamAgainst || [] }
+          } : null,
+          currentSpeaker: null,
+          turnOrder: [], // For team debates: alternating team speakers
+          currentTurnIndex: 0
         });
       }
       
       const room = debateRooms.get(data.debateId);
       
-      // Add participant to room
+      // Add participant to room with team info
       room.participants.set(data.userId, {
         playerName: data.playerName,
         socketId: socket.id,
         roomType: data.roomType || 'user-only',
+        debateType: data.debateType || data.roomType || 'user-only',
+        team: data.team || null, // For team debates: 'FOR' or 'AGAINST'
         joinedAt: new Date()
       });
       
-      console.log(`${data.playerName} joined debate ${data.debateId} (Topic: ${room.topic}). Total participants: ${room.participants.size}`);
+      console.log(`${data.playerName} joined debate ${data.debateId} (Type: ${room.debateType}). Total: ${room.participants.size}`);
+      
+      // Build turn order for team debates
+      if (room.debateType === 'team-debate' && room.turnOrder.length === 0) {
+        const teamForPlayers = Array.from(room.participants.entries())
+          .filter(([id, info]) => info.team === 'FOR')
+          .map(([id]) => id);
+        const teamAgainstPlayers = Array.from(room.participants.entries())
+          .filter(([id, info]) => info.team === 'AGAINST')
+          .map(([id]) => id);
+        
+        // Build alternating turn order: FOR, AGAINST, FOR, AGAINST...
+        const maxTurns = Math.max(teamForPlayers.length, teamAgainstPlayers.length);
+        for (let i = 0; i < maxTurns; i++) {
+          if (i < teamForPlayers.length) room.turnOrder.push(teamForPlayers[i]);
+          if (i < teamAgainstPlayers.length) room.turnOrder.push(teamAgainstPlayers[i]);
+        }
+      }
       
       socket.emit('debate-joined', { 
         message: 'Joined debate successfully',
         participantCount: room.participants.size,
         topic: room.topic,
         roomType: room.roomType,
+        debateType: room.debateType,
+        teams: room.teams,
+        turnOrder: room.turnOrder,
         participants: Array.from(room.participants.entries()).map(([id, info]) => ({
           userId: id,
-          playerName: info.playerName
+          playerName: info.playerName,
+          team: info.team
         }))
       });
       
-      // Notify all participants about new participant
+      // Notify all participants
       io.to(data.debateId).emit('player-joined', {
         userId: data.userId,
         playerName: data.playerName,
+        team: data.team || null,
         totalParticipants: room.participants.size,
+        debateType: room.debateType,
         participants: Array.from(room.participants.entries()).map(([id, info]) => ({
           userId: id,
-          playerName: info.playerName
-        }))
+          playerName: info.playerName,
+          team: info.team
+        })),
+        turnOrder: room.turnOrder
       });
     });
 

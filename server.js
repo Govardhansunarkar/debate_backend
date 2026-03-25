@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 require('dotenv').config();
 
 const app = express();
@@ -65,6 +66,34 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Setup PeerJS Server on a separate port and proxy requests to it
+// This makes /peerjs accessible through the main Express server
+const PEERJS_PORT = process.env.PEERJS_PORT || 9000;
+try {
+  require('peerjs-server').PeerServer({ 
+    port: PEERJS_PORT, 
+    path: '/peerjs',
+    debug: 0
+  });
+  console.log(`✅ PeerJS Server started on port ${PEERJS_PORT}`);
+  
+  // Add proxy to forward /peerjs requests to the PeerJS server
+  app.use('/peerjs', createProxyMiddleware({
+    target: `http://localhost:${PEERJS_PORT}`,
+    changeOrigin: true,
+    pathRewrite: { '^/peerjs': '/peerjs' },
+    ws: true, // Enable WebSocket support
+    onError: (err, req, res) => {
+      console.error('❌ PeerJS proxy error:', err.message);
+      res.status(503).json({ error: 'PeerJS unavailable' });
+    }
+  }));
+  console.log(`🔄 PeerJS proxy: /peerjs → http://localhost:${PEERJS_PORT}/peerjs`);
+} catch (err) {
+  console.warn(`⚠️ PeerJS failed:`, err.message);
+  console.warn('   Video features will not work');
+}
+
 // Routes
 const roomRoutes = require('./routes/roomRoutes');
 const debateRoutes = require('./routes/debateRoutes');
@@ -86,21 +115,6 @@ app.get('/', (req, res) => {
 // Socket.IO
 const debateSocket = require('./sockets/debateSocket');
 debateSocket(io);
-
-// Setup PeerJS Server on configurable port
-// For single-port deployment, use a reverse proxy (nginx) to route /peerjs to this port
-const PEERJS_PORT = process.env.PEERJS_PORT || 59000;
-try {
-  const peerServer = require('peerjs-server').PeerServer({ 
-    port: PEERJS_PORT, 
-    path: process.env.PEERJS_PATH || '/peerjs',
-    debug: process.env.PEERJS_DEBUG === 'true' ? 3 : 0
-  });
-  console.log(`🔗 PeerJS Server configured on port ${PEERJS_PORT}`);
-} catch (err) {
-  console.warn(`⚠️ PeerJS Server failed to start on port ${PEERJS_PORT}:`, err.message);
-  console.warn('ℹ️ Continuing without PeerJS - video features may not work');
-}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
