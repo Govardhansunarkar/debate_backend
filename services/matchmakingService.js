@@ -76,6 +76,7 @@ const checkForTeamMatch = () => {
 // Get matchmaking status
 const getMatchmakingStatus = () => {
   let nextMatchType = 'none';
+  
   if (waitingPlayers.length >= TEAM_MATCH_SIZE_LARGE) {
     nextMatchType = 'team-3v3';
   } else if (waitingPlayers.length >= TEAM_MATCH_SIZE) {
@@ -83,11 +84,12 @@ const getMatchmakingStatus = () => {
   } else if (waitingPlayers.length >= MIN_PLAYERS_FOR_MATCH) {
     nextMatchType = 'regular-1v1';
   }
-  
-  return {
-    playersWaiting: waitingPlayers.length,
-    estimatedWaitTime: waitingPlayers.length > 0 ? Math.random() * 30 : 0,
-    nextMatchType: nextMatchType
+
+  return { 
+    waitingCount: waitingPlayers.length,
+    players: waitingPlayers,
+    nextMatchType: nextMatchType,
+    estimatedWaitTime: waitingPlayers.length > 0 ? Math.random() * 30 : 0
   };
 };
 

@@ -33,10 +33,31 @@ module.exports = (io) => {
       
       addPlayerToQueue(player);
       socket.emit('queued', { position: data.position, topic: data.topic });
+
+      // Start a timer to auto-match with AI if no user joins within 30 seconds
+      const aiTimeout = setTimeout(() => {
+        // Only if player is still in queue
+        const status = require('../services/matchmakingService').getMatchmakingStatus();
+        const isInQueue = status.waitingCount > 0 && status.players.some(p => p.userId === data.userId);
+        
+        if (isInQueue) {
+          console.log(`🤖 Auto-matching ${data.playerName} with AI (Queue Timeout)`);
+          removePlayerFromQueue(data.userId);
+          
+          const debateId = `debate_ai_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+          socket.emit('match-found', {
+            debateId: debateId,
+            matchType: 'ai',
+            topic: data.topic || "Random Debate",
+            debateType: 'ai-debate'
+          });
+        }
+      }, 30000); // 30 seconds wait then AI match
       
       // Check for team match first (priority)
       const teamMatch = checkForTeamMatch();
       if (teamMatch.canMatch) {
+        clearTimeout(aiTimeout);
         console.log(`🎯 Team Match Found! ${teamMatch.teamSize}`);
         
         const debateId = `debate_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
