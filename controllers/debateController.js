@@ -51,7 +51,7 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 0  // No timeout - NVIDIA will respond whenever it's ready
+        timeout: 60000  // 60 seconds - NVIDIA can take time
       }
     );
 
@@ -380,7 +380,7 @@ Remember: You're talking to beginners, so keep it simple and friendly!`
           'Authorization': `Bearer ${nvidiaApiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 0  // No timeout - wait for NVIDIA
+        timeout: 60000  // 60 seconds - NVIDIA LLM can take time to generate quality feedback
       }
     );
 
@@ -731,7 +731,7 @@ Respond with ONLY valid JSON (no markdown):
             'Authorization': `Bearer ${nvidiaApiKey}`,
             'Content-Type': 'application/json'
           },
-          timeout: 0  // No timeout - wait as long as NVIDIA needs
+          timeout: 60000  // 60 seconds - NVIDIA can take time
         }
       );
 
@@ -943,7 +943,7 @@ Return ONLY valid JSON, no markdown:
             'Authorization': `Bearer ${nvidiaApiKey}`,
             'Content-Type': 'application/json'
           },
-          timeout: 30000
+          timeout: 60000  // 60 seconds - NVIDIA can take time for multi-participant analysis
         }
       );
 
