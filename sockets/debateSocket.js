@@ -225,6 +225,29 @@ module.exports = (io) => {
       });
     });
 
+    // Start debate signal - admin only
+    socket.on('start-debate', (data) => {
+      const room = debateRooms.get(data.debateId);
+      if (room) {
+        room.isActive = true;
+        room.startTime = new Date();
+        
+        // Simple turn logic for regular 1v1: Admin speaks first
+        const participants = Array.from(room.participants.keys());
+        if (participants.length > 1) {
+          room.currentSpeaker = participants[0]; // Admin (first person to join)
+          room.turnOrder = participants;
+        }
+
+        io.to(data.debateId).emit('debate-started', {
+          startTime: room.startTime,
+          currentSpeaker: room.currentSpeaker,
+          turnOrder: room.turnOrder,
+          topic: room.topic
+        });
+      }
+    });
+
     // End debate - store final data
     socket.on('end-debate', (data) => {
       console.log(`[Debate End] Ending debate: ${data.debateId}`);
