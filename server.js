@@ -33,18 +33,23 @@ if (process.env.FRONTEND_URL_LOCAL) {
 console.log('🔐 CORS Origins Configured:', corsOrigins);
 console.log('🔐 NODE_ENV:', process.env.NODE_ENV);
 
-// Socket.IO configuration
+// Socket.IO configuration - optimized for Render
 const io = socketIo(server, {
-  transports: ['websocket', 'polling'],
+  transports: ['websocket', 'polling'],  // Try websocket first, fallback to polling
   cors: {
     origin: corsOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
     allowEIO3: true  // Allow socket.io v3 clients
   },
-  pingInterval: 10000,
-  pingTimeout: 5000,
-  upgradeTimeout: 10000
+  // Increased timeouts for Render stability
+  pingInterval: 25000,   // Increased from 10000 (25 seconds)
+  pingTimeout: 20000,    // Increased from 5000 (20 seconds)
+  upgradeTimeout: 30000, // Increased from 10000 (30 seconds)
+  maxHttpBufferSize: 1e6, // 1MB buffer
+  // Connection settings
+  connectTimeout: 45000,
+  rejectUnauthorized: false // For development/staging
 });
 
 // Middleware - ORDER MATTERS: CORS first
