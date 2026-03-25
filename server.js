@@ -42,13 +42,13 @@ const io = socketIo(server, {
     credentials: true,
     allowEIO3: true  // Allow socket.io v3 clients
   },
-  // Increased timeouts for Render stability
-  pingInterval: 25000,   // Increased from 10000 (25 seconds)
-  pingTimeout: 20000,    // Increased from 5000 (20 seconds)
-  upgradeTimeout: 30000, // Increased from 10000 (30 seconds)
+  // Aggressive timeouts for Render free tier (very slow platform)
+  pingInterval: 60000,   // 60 seconds - long interval
+  pingTimeout: 40000,    // 40 seconds - plenty of time for response
+  upgradeTimeout: 60000, // 60 seconds - protocol upgrade timeout
   maxHttpBufferSize: 1e6, // 1MB buffer
   // Connection settings
-  connectTimeout: 45000,
+  connectTimeout: 60000,  // 60 seconds - initial connection attempt
   rejectUnauthorized: false // For development/staging
 });
 
