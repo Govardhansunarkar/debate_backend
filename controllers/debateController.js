@@ -268,13 +268,14 @@ exports.analyzeWithOpenAI = async (req, res) => {
     const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
     const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
 
-    // Filter user speeches (speaker === "user")
-    const userSpeeches = speeches.filter(s => s.speaker === 'user').map(s => s.text).join('\n\n');
+    // Filter user speeches (speaker !== "ai")
+    const userSpeeches = speeches.filter(s => s.speaker !== 'ai').map(s => s.text).join('\n\n');
     
     // Format all speeches with alternating speaker labels for context
     const speechText = speeches
       .map((s, idx) => {
-        const speaker = s.speaker === 'user' ? '👤 YOU' : '🤖 OPPONENT';
+        let speaker = s.speaker === 'ai' ? '🤖 OPPONENT' : `👤 ${s.speaker || 'USER'}`;
+        if (s.speaker === 'user') speaker = '👤 YOU';
         return `${speaker} (Speech ${idx + 1}): ${s.text}`;
       })
       .join("\n\n");
@@ -288,10 +289,10 @@ ${speechText}
 
 ---
 
-Analyze THE USER'S ARGUMENTS (marked as 👤 YOU) and give feedback that a beginner can understand and use.
+Analyze the performance of the human participants and give feedback that a beginner can understand and use.
 
 IMPORTANT GRADING INSTRUCTIONS:
-Calculate a grade for the user based on these factors ONLY:
+Calculate a grade based on these factors ONLY:
 - Did they explain their idea clearly? (0-2 points)
 - Did they use examples or real stories? (0-2 points)
 - Did they answer what the other person said? (0-2 points)
