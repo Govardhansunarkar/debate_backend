@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 require('dotenv').config();
 
 const app = express();
@@ -66,32 +65,32 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Setup PeerJS Server on a separate port and proxy requests to it
-// This makes /peerjs accessible through the main Express server
-const PEERJS_PORT = process.env.PEERJS_PORT || 9000;
+// Setup PeerJS Server using ExpressPeerServer (runs on same port as Express)
+// This is more reliable than separate port + proxy
+const { ExpressPeerServer } = require('peer');
+
 try {
-  require('peerjs-server').PeerServer({ 
-    port: PEERJS_PORT, 
+  const peerServer = ExpressPeerServer(server, {
+    debug: 1,
     path: '/peerjs',
-    debug: 0
+    concurrent_limit: 5000
   });
-  console.log(`✅ PeerJS Server started on port ${PEERJS_PORT}`);
   
-  // Add proxy to forward /peerjs requests to the PeerJS server
-  app.use('/peerjs', createProxyMiddleware({
-    target: `http://localhost:${PEERJS_PORT}`,
-    changeOrigin: true,
-    pathRewrite: { '^/peerjs': '/peerjs' },
-    ws: true, // Enable WebSocket support
-    onError: (err, req, res) => {
-      console.error('❌ PeerJS proxy error:', err.message);
-      res.status(503).json({ error: 'PeerJS unavailable' });
-    }
-  }));
-  console.log(`🔄 PeerJS proxy: /peerjs → http://localhost:${PEERJS_PORT}/peerjs`);
+  // Mount PeerJS on the Express app
+  app.use('/peerjs', peerServer);
+  console.log('✅ ExpressPeerServer mounted on /peerjs (same port as Express)');
+  
+  // Handle PeerJS events
+  peerServer.on('connection', (client) => {
+    console.log(`🔗 PeerJS Client Connected: ${client.getId()}`);
+  });
+  
+  peerServer.on('disconnect', (client) => {
+    console.log(`🔌 PeerJS Client Disconnected: ${client.getId()}`);
+  });
 } catch (err) {
-  console.warn(`⚠️ PeerJS failed:`, err.message);
-  console.warn('   Video features will not work');
+  console.warn(`⚠️ PeerJS Server setup failed:`, err.message);
+  console.warn('   Video features may not work properly');
 }
 
 // Routes
