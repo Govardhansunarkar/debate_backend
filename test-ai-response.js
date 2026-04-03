@@ -4,9 +4,9 @@ const testAPI = async () => {
   try {
     console.log('[Test] Calling API endpoint...');
     
-    const response = await axios.post('http://localhost:8000/api/debates/ai-response', {
-      userArgument: "Renewable energy is better than fossil fuels because it reduces carbon emissions",
-      topic: "Energy Future",
+    const response = await axios.post('http://localhost:3001/api/debates/ai-response', {
+      userArgument: "I think school uniforms should be mandatory to reduce bullying.",
+      topic: "School Uniforms",
       debateContext: []
     });
 

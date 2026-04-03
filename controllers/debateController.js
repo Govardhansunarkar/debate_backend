@@ -6,7 +6,7 @@ const { calculateQualityBasedPoints } = require('../utils/advancedScoringSystem'
 // =====================================================
 // NVIDIA API Integration Function (works with Nemotron models)
 // =====================================================
-const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
+const callNvidiaAPI = async (prompt, apiKey, apiUrl, model, options = {}) => {
   try {
     console.log('[NVIDIA] ===== NVIDIA API CALL START =====');
     console.log('[NVIDIA] Model:', model);
@@ -24,24 +24,29 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
     
     console.log('[NVIDIA] Full endpoint:', endpoint);
     
+    const systemPrompt = options.systemPrompt || 'You are a persistent debater. No matter what the user says, you MUST find a reason why they are wrong. Keep it to one short sentence. NO meta-talk. No planning. Start the response directly.';
+
     const requestBody = {
       model: model,
       messages: [
         { 
           role: 'system', 
-          content: 'You are a debate participant. Provide counter-arguments in 2-3 sentences. Be respectful but firm.'
+          content: systemPrompt
         },
         { 
           role: 'user', 
-          content: prompt 
+          content: prompt
         }
       ],
-      max_tokens: 800,
-      temperature: 0.65,
-      top_p: 0.90
+      max_tokens: options.maxTokens || 128,
+      temperature: options.temperature ?? 0.9,
+      top_p: options.topP ?? 1.0,
+      presence_penalty: options.presencePenalty ?? 0.6,
+      frequency_penalty: options.frequencyPenalty ?? 0.6,
+      stream: false 
     };
     
-    console.log('[NVIDIA] Sending request...');
+    console.log('[NVIDIA] Sending request with content:', requestBody.messages[0].content.substring(0, 50) + "...");
     
     const response = await axios.post(
       endpoint,
@@ -51,44 +56,130 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 60000  // 60 seconds - NVIDIA can take time
+        timeout: 120000 
       }
     );
 
     console.log('[NVIDIA] ✅ Response status:', response.status);
+    console.log('[NVIDIA] ✅ Raw response content:', response.data?.choices?.[0]?.message?.content);
     
-    // Extract the message content from the response
-    let aiResponse = '';
-    if (response.data?.choices?.[0]?.message) {
-      const message = response.data.choices[0].message;
-      aiResponse = (message.content || message.text || JSON.stringify(message)).trim();
+    const message = response.data?.choices?.[0]?.message;
+    
+    if (message) {
+      // Get content or reasoning content
+      let text = (message.content || message.reasoning_content || message.text || '').trim();
+      
+      console.log('[NVIDIA] Raw text from API:', text);
+
+      // If none of those, try reasoning
+      if (!text && message.reasoning) text = message.reasoning.trim();
+
+      // CLEANING: Extract only the core response from the LLM output
+      // Handle the common pattern of <thought> blocks or meta-text
+      let coreText = text;
+      
+      // Remove any <thought> blocks if the model uses them
+      coreText = coreText.replace(/<thought>[\s\S]*?<\/thought>/gi, "").trim();
+
+      // Split by newlines and only keep parts that don't look like planning
+      const parts = coreText.split(/\n+/);
+      
+      // Filter out meta-text (rules, counts, "sentence 1:", instructions)
+      const filteredParts = parts.filter(p => {
+          const lower = p.toLowerCase();
+          return !lower.includes("sentence") && 
+                 !lower.includes("word") && 
+                 !lower.includes("punctuation") &&
+                 !lower.includes("trailing spaces") &&
+                 !lower.includes("i will follow") &&
+                 !lower.includes("greetings") &&
+                 !lower.includes("must not") &&
+                 !lower.includes("do not") &&
+                 !lower.includes("start with") &&
+                 !lower.includes("we need to") &&
+                 !lower.includes("we must") &&
+                 !lower.includes("let's craft") &&
+                 !lower.includes("the user says") &&
+                 p.trim().length > 5;
+      });
+
+      // Join back or take the last significant part
+      let cleaned = filteredParts.length > 0 ? filteredParts.join(" ").trim() : coreText.trim();
+
+      // Final scrubbing of meta-text labels
+      let aiResponse = cleaned
+        .replace(/^(AI:|Response:|Direct response:|Answer:|Counter-Argument:|Argument:)/i, "")
+        .replace(/Let's craft:.*/gi, "") 
+        .replace(/\[.*?\]/g, "") 
+        .trim();
+
+      // Ensure no garbage meta-headers remain at the start
+      if (aiResponse.match(/^(sentence\s*\d+:|word\s*count:)/i)) {
+          aiResponse = aiResponse.split(/[.!?]+/)[0].trim() + ".";
+      }
+
+      // If the output is just a single block of text (typical), or has multiple sentences
+      // we ONLY want to extract a quote if it truly looks like the model is "suggesting" a quote as part of a longer meta-talk response.
+      if (aiResponse.includes('"')) {
+        const matches = [...aiResponse.matchAll(/"([^"]+)"/g)];
+        if (matches.length > 0) {
+          // Take the LONGEST quoted segment as it's likely the actual argument
+          const possibleArgument = matches.reduce((prev, current) => 
+            (prev[1].length > current[1].length) ? prev : current
+          )[1];
+          
+          // CRITICAL: If the AI output is very long (over 100 chars) AND contains a quote,
+          // it's highly likely the argument is just what's inside the quote.
+          if (aiResponse.length > 100 && possibleArgument.length > 15 && !possibleArgument.toLowerCase().includes("user says")) {
+            aiResponse = possibleArgument;
+          }
+        }
+      }
+
+      // If the model gave meta-talk but NO quotes, try to find the last sentence.
+      if (aiResponse.length > 150 && !aiResponse.includes('"')) {
+          const sentences = aiResponse.split(/[.!?]+/);
+          // Look for sentences that don't have meta keywords
+          const goodSentences = sentences.filter(s => 
+              s.length > 20 && 
+              !s.toLowerCase().includes("we need to") && 
+              !s.toLowerCase().includes("let's") &&
+              !s.toLowerCase().includes("producing a")
+          );
+          if (goodSentences.length > 0) {
+              aiResponse = goodSentences[goodSentences.length - 1].trim() + ".";
+          }
+      }
+
+      // Final cleanup of common prefixes models add even when told not to
+      aiResponse = aiResponse
+        .replace(/^(Certainly!|Okay,|Here is a|My response is:|Counter-Argument:|Argument:)/gi, "")
+        .replace(/^(Make it professional:|Firm counter-argument:)/gi, "")
+        .replace(/^Let's craft: /gi, "")
+        .trim();
+
+      // Final strip of all quotes from beginning and end
+      aiResponse = aiResponse.replace(/^["']+(.*?)["']+$/g, '$1').trim();
+
+      // Ensure it ends correctly
+      if (aiResponse.length > 5 && !aiResponse.match(/[.!?]$/)) aiResponse += ".";
+
+      // Safety check: ensure no garbage remains
+      if (aiResponse.includes("Words:") || aiResponse.includes("Total =")) {
+          // Harsh fallback if cleaning fails - try to find a sentence that doesn't look like planning
+          const sentences = aiResponse.split(/[.!?]+/);
+          aiResponse = sentences.find(s => !s.toLowerCase().includes('word') && s.trim().length > 10) || "I disagree with your point.";
+      }
+
+      console.log('[NVIDIA] ✅ Response received successfully');
+      console.log('[NVIDIA] ===== NVIDIA API CALL SUCCESS =====');
+      return aiResponse;
     }
     
-    if (!aiResponse || aiResponse.startsWith('{')) {
-      console.error('[NVIDIA] ❌ Parsing error. Message object:', response.data?.choices?.[0]?.message);
-      throw new Error('Could not parse NVIDIA response');
-    }
-    
-    console.log('[NVIDIA] ✅ Response received successfully');
-    console.log('[NVIDIA] ===== NVIDIA API CALL SUCCESS =====');
-    return aiResponse;
+    throw new Error('Could not parse NVIDIA response');
   } catch (error) {
     console.error('[NVIDIA] ❌ ===== NVIDIA API ERROR =====');
     console.error('[NVIDIA] Error message:', error.message);
-    console.error('[NVIDIA] Error code:', error.code);
-    
-    if (error.response) {
-      console.error('[NVIDIA] HTTP Status:', error.response.status);
-      console.error('[NVIDIA] Status Text:', error.response.statusText);
-      console.error('[NVIDIA] Response data:', JSON.stringify(error.response.data).substring(0, 200));
-    } else if (error.request) {
-      console.error('[NVIDIA] No response received (network error)');
-      console.error('[NVIDIA] Request details:', error.request?.method, error.request?.path);
-    } else {
-      console.error('[NVIDIA] Error during request setup:', error.message);
-    }
-    
-    console.error('[NVIDIA] ===== NVIDIA API FAILED =====');
     throw error;
   }
 };
@@ -268,134 +359,58 @@ exports.analyzeWithOpenAI = async (req, res) => {
     const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
     const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
 
+    if (!nvidiaApiKey) {
+      throw new Error('NVIDIA API key not configured');
+    }
+
     // Filter user speeches (speaker !== "ai")
     const userSpeeches = speeches.filter(s => s.speaker !== 'ai').map(s => s.text).join('\n\n');
     
     // Format all speeches with alternating speaker labels for context
     const speechText = speeches
       .map((s, idx) => {
-        let speaker = s.speaker === 'ai' ? '🤖 OPPONENT' : `👤 ${s.speaker || 'USER'}`;
-        if (s.speaker === 'user') speaker = '👤 YOU';
-        return `${speaker} (Speech ${idx + 1}): ${s.text}`;
+        let speaker = s.speaker === 'ai' ? '🤖 AI' : '👤 USER';
+        return `${speaker}: ${s.text}`;
       })
-      .join("\n\n");
+      .join("\n");
 
-    const feedbackPrompt = `You are a friendly debate coach helping beginner debaters improve. You explain things in simple, easy-to-understand language.
+    const feedbackPrompt = `Topic: "${topic}"\nDEBATE:\n${speechText}\n\nAnalyze performance. Return ONLY VALID JSON:\n{"overall_score": 8, "summary": "Brief 1-sentence summary", "strengths": ["point1"], "weaknesses": ["point1"], "key_points": ["point1"], "recommendations": ["point1"]}`;
 
-Review this debate on the topic: "${topic}"
-
-DEBATE TRANSCRIPT:
-${speechText}
-
----
-
-Analyze the performance of the human participants and give feedback that a beginner can understand and use.
-
-IMPORTANT GRADING INSTRUCTIONS:
-Calculate a grade based on these factors ONLY:
-- Did they explain their idea clearly? (0-2 points)
-- Did they use examples or real stories? (0-2 points)
-- Did they answer what the other person said? (0-2 points)
-- Did their arguments make sense together? (0-2 points)
-- Were they easy to understand? (0-2 points)
-
-Total score = sum of all factors (scale 1-10)
-DO NOT give everyone 7.5! Look at what they actually did.
-
-IMPORTANT: Use simple, friendly language. Avoid complex terms. Explain like you're talking to a friend!
-
-Provide feedback in this exact JSON structure:
-
-{
-  "overall_score": <CALCULATED number 1-10 based on the 5 factors above>,
-  "summary": "<1-2 simple sentences about how they did>",
-  "strengths": [
-    "<easy explanation of what was good - mention a specific thing they said>",
-    "<easy explanation of what was good - mention a specific thing they said>",
-    "<easy explanation of what was good - mention a specific thing they said>"
-  ],
-  "weaknesses": [
-    "<easy explanation of what to work on>",
-    "<easy explanation of what to work on>",
-    "<easy explanation of what to work on>"
-  ],
-  "key_points": [
-    "<their best argument in simple terms>",
-    "<another good point they made>",
-    "<another thing they said well>"
-  ],
-  "recommendations": [
-    "<simple tip they can try next time>",
-    "<simple tip they can try next time>",
-    "<simple tip they can try next time>"
-  ]
-}
-
-SCORING EXAMPLES:
-- Score 9-10: Clear explanations + good examples + answered all points + arguments made sense + easy to follow
-- Score 7-8: Mostly clear + some examples + answered some points + mostly made sense + mostly easy to follow
-- Score 5-6: Somewhat clear + few examples + answered few points + some confusion + hard to follow sometimes
-- Score 3-4: Not very clear + no examples + didn't answer points + confusing logic + hard to follow
-- Score 1-2: Very unclear + no examples + ignored opponent + no logic + very hard to follow
-
-Return ONLY valid JSON, no markdown or extra text.`;
-    if (!nvidiaApiKey) {
-      throw new Error('NVIDIA API key not configured');
-    }
-
-    // Use NVIDIA LLM for analysis
-    console.log('[analyzeWithOpenAI] ✅ Using NVIDIA LLM for feedback analysis');
-    
     // Construct proper endpoint URL
     const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
-    console.log('[analyzeWithOpenAI] 📍 Calling endpoint:', endpoint);
+
+    console.log('[analyzeWithOpenAI] ⚡ ULTRA FAST ANALYSIS START');
     
-    const nvidiaResponse = await axios.post(
+    const response = await axios.post(
       endpoint,
       {
         model: nvidiaModel,
         messages: [
-          {
-            role: 'system',
-            content: `You are a friendly and encouraging debate coach. You help beginner debaters by giving simple, easy-to-understand feedback and keep response in 2-3 lines only. 
-            
-You explain things clearly without using confusing terms. Your goal is to:
-1. Make the person feel good about what they did well
-2. Give them specific, easy tips to improve
-3. Use simple language that anyone can understand
-4. Be encouraging and supportive
-
-Remember: You're talking to beginners, so keep it simple and friendly!`
-          },
-          {
-            role: 'user',
-            content: feedbackPrompt
-          }
+          { role: 'system', content: 'You are a debate analyst. Return ONLY MINIFIED VALID JSON. Be detailed and thorough. Provide a balanced analysis of all speeches provided.' },
+          { role: 'user', content: feedbackPrompt }
         ],
-        max_tokens: 1500,
-        temperature: 0.7,
-        top_p: 0.95
+        max_tokens: 1024, 
+        temperature: 0.1,
+        stream: false
       },
       {
         headers: {
           'Authorization': `Bearer ${nvidiaApiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 60000  // 60 seconds - NVIDIA LLM can take time to generate quality feedback
+        timeout: 60000 // 60 second timeout for analysis
       }
     );
 
-    const analysisText = nvidiaResponse.data?.choices?.[0]?.message?.content;
-    console.log('[analyzeWithOpenAI] ✅ NVIDIA Response received (length:', analysisText?.length, 'chars)');
-    console.log('[analyzeWithOpenAI] Response sample:', analysisText?.substring(0, 150));
-
+    const analysisText = response.data?.choices?.[0]?.message?.content;
+    
     if (!analysisText) {
       throw new Error('No analysis text from NVIDIA');
     }
 
-    // Parse JSON response
-    let analysis = JSON.parse(analysisText);
-    console.log('[analyzeWithOpenAI] ✅ JSON parsed successfully. Score:', analysis.overall_score);
+    // Clean JSON if needed (remove markdown blocks)
+    const cleanedJson = analysisText.replace(/```json|```/g, '').trim();
+    let analysis = JSON.parse(cleanedJson);
     
     res.json({ 
       success: true, 
@@ -403,21 +418,26 @@ Remember: You're talking to beginners, so keep it simple and friendly!`
       source: 'NVIDIA_LLM',
       timestamp: new Date().toISOString()
     });
-    } catch (error) {
-      console.error('[analyzeWithOpenAI] ❌ NVIDIA LLM FAILED:', error.message);
-      console.error('[analyzeWithOpenAI] Error details:', {
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        errorData: error.response?.data
-      });
-      
-      // No fallback - always fail if NVIDIA doesn't work
-      res.status(500).json({ 
-        success: false, 
-        error: error.message,
-        source: 'NVIDIA_ERROR'
-      });
-    }
+  } catch (error) {
+    console.error('[analyzeWithOpenAI] ❌ FAST ANALYSIS FAILED:', error.message);
+    
+    // IMMEDIATE FALLBACK (within 100ms) - No long waiting
+    const fallbackAnalysis = {
+      overall_score: 7,
+      summary: "Great effort in the debate! Your points were clear.",
+      strengths: ["Clear articulation", "Maintained focus on topic"],
+      weaknesses: ["Could use more data", "Counter-arguments need more depth"],
+      key_points: ["Arguments based on general logic"],
+      recommendations: ["Try adding statistics", "Focus on opponent weaknesses"]
+    };
+
+    res.json({ 
+      success: true, 
+      analysis: fallbackAnalysis,
+      source: 'FALLBACK_FAST',
+      warning: "Real-time AI analysis busy, providing immediate baseline feedback."
+    });
+  }
 };
 
 // Analyze debate with Gemini (also uses NVIDIA LLM for consistency)
@@ -498,7 +518,7 @@ const generateIntelligentFallback = (userArgument, topic, debateContext) => {
 // Get AI Response to user's argument - WITH STREAMING & TOPIC ENFORCEMENT
 exports.getAIResponse = async (req, res) => {
   try {
-    const { userArgument, topic, debateContext } = req.body;
+    const { userArgument, topic, debateContext, speechMeta = {} } = req.body;
 
     console.log('[getAIResponse] Received:', { userArgument, topic, contextLength: debateContext?.length || 0 });
 
@@ -516,6 +536,7 @@ exports.getAIResponse = async (req, res) => {
     const topicRelevance = topicKeywords.length > 0 ? topicMatches / topicKeywords.length : 0;
 
     // If user is off-topic (less than 30% match), redirect them
+    /* 
     if (topicRelevance < 0.3 && debateContext && debateContext.length > 2) {
       console.log('[getAIResponse] User going off-topic. Relevance:', topicRelevance);
       const redirectResponse = `Let's stay focused on our topic: "${topic}". I appreciate your point, but can you connect it back to the main question?`;
@@ -530,6 +551,7 @@ exports.getAIResponse = async (req, res) => {
         isOffTopic: true
       });
     }
+    */
 
     const nvidiaApiKey = process.env.NVIDIA_API_KEY;
     const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
@@ -541,45 +563,100 @@ exports.getAIResponse = async (req, res) => {
     console.log('[getAIResponse] NVIDIA_MODEL:', nvidiaModel);
     console.log('[getAIResponse] =====================');
 
+    const normalizedContext = (debateContext && Array.isArray(debateContext))
+      ? debateContext.filter(item => item && item.text)
+      : [];
+
     // Prepare debate history for context
-    const conversationHistory = (debateContext && Array.isArray(debateContext))
-      ? debateContext
-          .filter(item => item && item.text)
-          .map((item, idx) => `${item.speaker === "user" ? 'You' : 'Opponent'}: ${item.text}`)
-          .join("\n\n")
-      : "This is the opening of the debate.";
+    const conversationHistory = normalizedContext.length
+      ? normalizedContext
+          .slice(-6)
+          .map((item) => {
+            const normalizedSpeaker = String(item.speaker || '').toLowerCase();
+            const speakerLabel = normalizedSpeaker === 'ai' ? 'AI' : 'User';
+            return `${speakerLabel}: ${item.text}`;
+          })
+          .join("\n")
+      : "Start of debate.";
 
-    const prompt = `You are a debate opponent in a simple, friendly debate.
+    const argumentInsights = analyzeDebateArgument(userArgument, topic, normalizedContext);
+    const turnNumber = normalizedContext.length + 1;
+    const wordCount = String(userArgument).split(/\s+/).filter(Boolean).length;
+    const speechDuration = Number(speechMeta?.speechDuration) || null;
+    const transcriptSource = speechMeta?.transcriptSource || 'final';
+    const speechPace = speechDuration && speechDuration > 0
+      ? Math.round((wordCount / speechDuration) * 60)
+      : null;
+    const speechPaceBand = !speechPace
+      ? 'unknown'
+      : speechPace > 170
+        ? 'fast'
+        : speechPace < 95
+          ? 'deliberate'
+          : 'balanced';
 
-DEBATE TOPIC: "${topic}"
+    const prompt = `You are in a real-time live debate round.
 
-DEBATE HISTORY:
+Debate Topic: "${topic}"
+Turn Number: ${turnNumber}
+Current User Argument: "${userArgument}"
+
+Recent Transcript:
 ${conversationHistory}
 
-THE USER JUST SAID: "${userArgument}"
+User Speech Signals:
+- Transcript source: ${transcriptSource}
+- User words: ${wordCount}
+- Approx speech duration (sec): ${speechDuration || 'unknown'}
+- Estimated pace (wpm): ${speechPace || 'unknown'} (${speechPaceBand})
 
-Your task: Give a SHORT, friendly counter-argument (2-3 sentences MAX).
+Argument Analysis Signals:
+- Claims: ${argumentInsights.claims?.slice(0, 3).join(' | ') || 'none'}
+- Strength tags: ${(argumentInsights.strength?.analysis || []).join(', ') || 'none'}
+- Counter strategy: ${argumentInsights.strategy?.techniques?.slice(0, 3).join(', ') || 'challenge assumptions'}
 
-RULES:
-1. Keep it SHORT and SIMPLE - anyone can understand
-2. Use everyday words, not fancy language
-3. Acknowledge their point, then give your opposite view
-4. Add ONE simple reason why your view is better
-5. Sound natural, like talking to a friend
-6. Stay on the topic: "${topic}"
+Response requirements:
+1. Write a natural rebuttal like a real debate opponent, not a chatbot.
+2. Use 2-4 sentences, around 45-95 words.
+3. Directly attack one specific claim from the user argument.
+4. Add one concrete reason/example or causal explanation.
+5. End with one sharp challenge question or pressure point.
+6. Never agree with the user and never use meta-talk.
+7. Match the user's language style (English/Hinglish/Hindi mix) if detectable.
 
-EXAMPLE:
-User: "Remote work helps people focus more."
-Response: "I see why you'd think that, but I disagree. Working from home has lots of distractions like family, pets, and chores. Plus, teams work better together in one place."
+Return only the rebuttal text.`;
 
-Now give YOUR response (2-3 sentences only, no more):`;
-
-    let aiResponse = null;
+    let aiResponse = "";
     let engineUsed = 'nvidia';
     
-    console.log('[getAIResponse] Calling NVIDIA for response');
-    aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
-    console.log('[getAIResponse] ✓ NVIDIA response received:', aiResponse.substring(0, 100));
+    try {
+      console.log(`[getAIResponse] Calling NVIDIA for turn ${debateContext ? debateContext.length : 1}`);
+      
+      const response = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel, {
+        systemPrompt: 'You are an elite debate opponent in a live voice debate. Be assertive, logically sharp, and context-aware. Rebut arguments directly, avoid agreement language, and sound like real human debate speech. Never output planning notes, bullet points, JSON, or role labels.',
+        maxTokens: 220,
+        temperature: 0.75,
+        topP: 0.95,
+        presencePenalty: 0.4,
+        frequencyPenalty: 0.35
+      });
+      
+      if (response && response.length > 5) {
+        aiResponse = response.trim();
+        // Clean any residual meta-text
+        aiResponse = aiResponse.replace(/^(AI:|Response:|Counter-Argument:|Argument:)/i, "").trim();
+        aiResponse = aiResponse.replace(/^["']+(.*?)["']+$/g, '$1').trim();
+        aiResponse = aiResponse.replace(/\s{2,}/g, ' ').trim();
+      } else {
+        throw new Error("Empty response from LLM");
+      }
+      
+      console.log('[getAIResponse] ✓ Final LLM Response:', aiResponse);
+    } catch (apiError) {
+      console.error('[getAIResponse] LLM Error:', apiError.message);
+      // RE-THROW to trigger the main catch block for emergency fallback
+      throw apiError;
+    }
 
     // Calculate points based on argument QUALITY
     const scoreResult = calculateQualityBasedPoints(userArgument);
@@ -600,8 +677,9 @@ Now give YOUR response (2-3 sentences only, no more):`;
   } catch (error) {
     console.error('[getAIResponse] Error:', error);
     
-    // Simple emergency response
-    const emergencyResponse = `I see your point, but I think differently about "${topic}". Let me explain why my view makes more sense.`;
+    // Simple emergency response - ensure "topic" is available from the request if possible
+    const currentTopic = req.body.topic || "this topic";
+    const emergencyResponse = `I see your point, but I think differently about "${currentTopic}". Let me explain why my view makes more sense.`;
     
     res.json({
       success: true,

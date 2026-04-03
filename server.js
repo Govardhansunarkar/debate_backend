@@ -1,4 +1,5 @@
 const express = require('express');
+const db = require("./firebase"); 
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
@@ -35,18 +36,21 @@ console.log('🔐 NODE_ENV:', process.env.NODE_ENV);
 
 // Socket.IO configuration - optimized for Render
 const io = socketIo(server, {
-  transports: ['websocket', 'polling'],  // Try websocket first, fallback to polling
+  transports: ['websocket', 'polling'],  // Prioritize WebSocket, fallback to polling
   cors: {
-    origin: corsOrigins,
+    origin: (origin, callback) => {
+      // Allow all development origins for stability during fix
+      callback(null, true);
+    },
     methods: ['GET', 'POST'],
     credentials: true,
-    allowEIO3: true  // Allow socket.io v3 clients
+    allowEIO3: true
   },
-  // Aggressive timeouts for Render free tier (very slow platform)
-  pingInterval: 60000,   // 60 seconds - long interval
-  pingTimeout: 40000,    // 40 seconds - plenty of time for response
-  upgradeTimeout: 60000, // 60 seconds - protocol upgrade timeout
-  maxHttpBufferSize: 1e6, // 1MB buffer
+  // Aggressive timeouts for stability
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  upgradeTimeout: 30000,
+  maxHttpBufferSize: 1e7, // Increase to 10MB for video/audio stability
   // Connection settings
   connectTimeout: 60000,  // 60 seconds - initial connection attempt
   rejectUnauthorized: false // For development/staging
@@ -114,6 +118,54 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ message: 'Welcome to AI Debate Arena API' });
+});
+
+// 👇 YE IMPORTANT HAI
+app.post("/save", async (req, res) => {
+  try {
+    const data = req.body; // jo data frontend se aayega
+
+    console.log("Data received:", data); // check karne ke liye
+
+    await db.collection("debates").add(data); // Firebase me save
+
+    res.send("Data saved successfully 🚀");
+  } catch (error) {
+    console.log(error);
+    res.status(500).send("Error saving data");
+  }
+});
+
+// 👇 Browser verification ke liye GET route
+app.get("/save", (req, res) => {
+  res.send("Please use POST method from Postman or Frontend to save data. This route is working! ✅");
+});
+
+// 👇 Google Login के बाद User का डेटा 'users' कलेक्शन में सेव करने के लिए
+app.post("/api/users/login", async (req, res) => {
+  try {
+    const { uid, email, displayName, photoURL } = req.body;
+
+    if (!uid) {
+      return res.status(400).send("User ID is required");
+    }
+
+    console.log("Saving user:", displayName, email);
+
+    // .set() का इस्तेमाल 'merge: true' के साथ ताकि बार-बार लॉगिन करने पर डेटा ओवरराइट न हो, बस अपडेट हो
+    await db.collection("users").doc(uid).set({
+      uid,
+      email,
+      displayName,
+      photoURL,
+      lastLogin: new Date().toISOString()
+    }, { merge: true });
+
+    res.send("User authenticated and data stored successfully! 👤✅");
+  } catch (error) {
+    console.error("User save error:", error);
+    res.status(500).send("Error saving user data");
+  }
 });
 
 // Socket.IO
