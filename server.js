@@ -1,5 +1,5 @@
 const express = require('express');
-const db = require("./firebase"); 
+const { db, isFirebaseReady, firebaseInitError } = require("./firebase");
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
@@ -120,9 +120,23 @@ app.get('/', (req, res) => {
   res.json({ message: 'Welcome to AI Debate Arena API' });
 });
 
+const ensureFirebase = (res) => {
+  if (!isFirebaseReady || !db) {
+    return res.status(503).json({
+      success: false,
+      error: 'Firebase is not configured on server',
+      details: firebaseInitError ? firebaseInitError.message : 'Missing Firebase credentials'
+    });
+  }
+  return null;
+};
+
 // 👇 YE IMPORTANT HAI
 app.post("/save", async (req, res) => {
   try {
+    const firebaseErrorResponse = ensureFirebase(res);
+    if (firebaseErrorResponse) return;
+
     const data = req.body; // jo data frontend se aayega
 
     console.log("Data received:", data); // check karne ke liye
@@ -144,6 +158,9 @@ app.get("/save", (req, res) => {
 // 👇 Google Login के बाद User का डेटा 'users' कलेक्शन में सेव करने के लिए
 app.post("/api/users/login", async (req, res) => {
   try {
+    const firebaseErrorResponse = ensureFirebase(res);
+    if (firebaseErrorResponse) return;
+
     const { uid, email, displayName, photoURL } = req.body;
 
     if (!uid) {
