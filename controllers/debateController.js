@@ -374,23 +374,42 @@ exports.analyzeWithOpenAI = async (req, res) => {
       })
       .join("\n");
 
-    const feedbackPrompt = `Topic: "${topic}"\nDEBATE:\n${speechText}\n\nAnalyze performance. Return ONLY VALID JSON:\n{"overall_score": 8, "summary": "Brief 1-sentence summary", "strengths": ["point1"], "weaknesses": ["point1"], "key_points": ["point1"], "recommendations": ["point1"]}`;
+    // ⚡ OPTIMIZED: Create a cache key for this debate's speeches
+    const crypto = require('crypto');
+    const speechHash = crypto.createHash('md5').update(JSON.stringify(speeches) + topic).digest('hex').substring(0, 8);
+    const cacheKey = `feedback_${speechHash}`;
+    
+    // Check if we have cached feedback
+    const feedbackCache = global.feedbackCache || {};
+    if (feedbackCache[cacheKey] && Date.now() - feedbackCache[cacheKey].timestamp < 3600000) {
+      console.log('[analyzeWithOpenAI] ✅ CACHED RESULT (within 1 hour)');
+      return res.json({ 
+        success: true, 
+        analysis: feedbackCache[cacheKey].data,
+        source: 'CACHED_NVIDIA_LLM',
+        timestamp: new Date().toISOString()
+      });
+    }
+    if (!global.feedbackCache) global.feedbackCache = {};
+
+    // ⚡ OPTIMIZED: Use shorter, faster prompt for quicker LLM response
+    const feedbackPrompt = `Topic: ${topic}\nDebate (${speeches.length} turns):\n${speechText}\n\nReturn JSON: {"overall_score": 1-10, "summary": "1 sentence", "strengths": [2 items], "weaknesses": [2 items], "recommendations": [2 items]}`;
 
     // Construct proper endpoint URL
     const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
 
-    console.log('[analyzeWithOpenAI] ⚡ ULTRA FAST ANALYSIS START');
+    console.log('[analyzeWithOpenAI] ⚡ SPEED OPTIMIZED START (15s timeout)');
     
     const response = await axios.post(
       endpoint,
       {
         model: nvidiaModel,
         messages: [
-          { role: 'system', content: 'You are a debate analyst. Return ONLY MINIFIED VALID JSON. Be detailed and thorough. Provide a balanced analysis of all speeches provided.' },
+          { role: 'system', content: 'Return ONLY valid JSON. Concise analysis.' },
           { role: 'user', content: feedbackPrompt }
         ],
-        max_tokens: 1024, 
-        temperature: 0.1,
+        max_tokens: 256,  // ⚡ Reduced from 1024 for faster generation
+        temperature: 0.05,  // ⚡ Lower temp for faster deterministic response
         stream: false
       },
       {
@@ -398,7 +417,7 @@ exports.analyzeWithOpenAI = async (req, res) => {
           'Authorization': `Bearer ${nvidiaApiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 60000 // 60 second timeout for analysis
+        timeout: 15000  // ⚡ Reduced from 60s to 15s for aggressive timeout
       }
     );
 
@@ -411,6 +430,12 @@ exports.analyzeWithOpenAI = async (req, res) => {
     // Clean JSON if needed (remove markdown blocks)
     const cleanedJson = analysisText.replace(/```json|```/g, '').trim();
     let analysis = JSON.parse(cleanedJson);
+    
+    // ⚡ Cache the result for future identical debates
+    global.feedbackCache[cacheKey] = {
+      data: analysis,
+      timestamp: Date.now()
+    };
     
     res.json({ 
       success: true, 
