@@ -3,6 +3,39 @@ const { Debate, debates, rooms } = require('../models/index');
 const { analyzeDebateArgument } = require('../utils/debateArgumentAnalysis');
 const { calculateQualityBasedPoints } = require('../utils/advancedScoringSystem');
 
+const STOPWORDS = new Set([
+  'the', 'is', 'are', 'was', 'were', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'your', 'you',
+  'about', 'have', 'has', 'had', 'will', 'would', 'could', 'should', 'what', 'when', 'where', 'which',
+  'their', 'there', 'than', 'then', 'them', 'they', 'been', 'being', 'but', 'because', 'while', 'also',
+  'very', 'more', 'most', 'only', 'just', 'over', 'under', 'after', 'before', 'against', 'between',
+  'through', 'during', 'such', 'each', 'any', 'all', 'not'
+]);
+
+const extractKeywords = (text, minLength = 4) => {
+  if (!text) return [];
+  return String(text)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= minLength && !STOPWORDS.has(w));
+};
+
+const calculateKeywordRelevance = (text, keywords = []) => {
+  if (!text || !keywords.length) return 0;
+  const lowerText = String(text).toLowerCase();
+  const uniqueKeywords = [...new Set(keywords)];
+  const matched = uniqueKeywords.filter((kw) => lowerText.includes(kw)).length;
+  return matched / uniqueKeywords.length;
+};
+
+const buildTopicLockedFallbackResponse = (userArgument, topic, argumentInsights) => {
+  const claimSnippet = String(userArgument || '').trim().slice(0, 140) || `your position on ${topic}`;
+  const strongestClaim = argumentInsights?.claims?.[0] || claimSnippet;
+  const strategyHint = argumentInsights?.strategy?.techniques?.[0] || 'causal weakness';
+
+  return `But "${strongestClaim}" still misses the key trade-off in ${topic}, so the point is not fully convincing. If it is really strong, explain why it still holds when the practical consequences and counter-evidence are pushed hard.`;
+};
+
 // =====================================================
 // NVIDIA API Integration Function (works with Nemotron models)
 // =====================================================
@@ -24,7 +57,7 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model, options = {}) => {
     
     console.log('[NVIDIA] Full endpoint:', endpoint);
     
-    const systemPrompt = options.systemPrompt || 'You are a persistent debater. No matter what the user says, you MUST find a reason why they are wrong. Keep it to one short sentence. NO meta-talk. No planning. Start the response directly.';
+    const systemPrompt = options.systemPrompt || 'You are the second speaker in a simple back-and-forth debate. Reply like Person 2 in a sample classroom debate: short, natural, direct, and focused on the user\'s last point. Keep it conversational, do not be generic, and do not use meta-talk. Start the response directly.';
 
     const requestBody = {
       model: model,
@@ -555,16 +588,15 @@ exports.getAIResponse = async (req, res) => {
     }
 
     // Check if user is going off-topic
-    const topicKeywords = topic.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const topicKeywords = extractKeywords(topic, 4);
     const userWords = userArgument.toLowerCase().split(/\s+/);
     const topicMatches = topicKeywords.filter(kw => userWords.some(uw => uw.includes(kw))).length;
     const topicRelevance = topicKeywords.length > 0 ? topicMatches / topicKeywords.length : 0;
 
-    // If user is off-topic (less than 30% match), redirect them
-    /* 
-    if (topicRelevance < 0.3 && debateContext && debateContext.length > 2) {
+    // If user is off-topic (less than 30% match), redirect them firmly
+    if (topicRelevance < 0.25 && debateContext && debateContext.length > 2) {
       console.log('[getAIResponse] User going off-topic. Relevance:', topicRelevance);
-      const redirectResponse = `Let's stay focused on our topic: "${topic}". I appreciate your point, but can you connect it back to the main question?`;
+      const redirectResponse = `We're debating: "${topic}". Your argument is moving away from this topic. Let's refocus: can you explain how your point connects back to the core question about ${topic}?`;
       
       return res.json({
         success: true,
@@ -576,7 +608,6 @@ exports.getAIResponse = async (req, res) => {
         isOffTopic: true
       });
     }
-    */
 
     const nvidiaApiKey = process.env.NVIDIA_API_KEY;
     const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
@@ -607,6 +638,8 @@ exports.getAIResponse = async (req, res) => {
     const argumentInsights = analyzeDebateArgument(userArgument, topic, normalizedContext);
     const turnNumber = normalizedContext.length + 1;
     const wordCount = String(userArgument).split(/\s+/).filter(Boolean).length;
+    const responseMode = speechMeta?.responseMode || 'direct-rebuttal';
+    const silenceDurationSec = Number(speechMeta?.silenceDurationSec) || null;
     const speechDuration = Number(speechMeta?.speechDuration) || null;
     const transcriptSource = speechMeta?.transcriptSource || 'final';
     const speechPace = speechDuration && speechDuration > 0
@@ -619,6 +652,12 @@ exports.getAIResponse = async (req, res) => {
         : speechPace < 95
           ? 'deliberate'
           : 'balanced';
+
+            const responseStyleInstruction = responseMode === 'auto-counter'
+          ? `This is a silence counterattack turn: the user has stayed silent for about ${silenceDurationSec || 'several'} seconds.
+        8. Reply like the next line in a natural debate sample: short, direct, and forceful.
+        9. Keep tone assertive but debate-safe (no abuse, no slurs).`
+          : `8. Reply like the next line in a sample back-and-forth debate and stay tightly tied to the latest user claim.`;
 
     const prompt = `You are in a real-time live debate round.
 
@@ -642,12 +681,14 @@ Argument Analysis Signals:
 
 Response requirements:
 1. Write a natural rebuttal like a real debate opponent, not a chatbot.
-2. Use 2-4 sentences, around 45-95 words.
+2. Use only 1-2 sentences, around 25-45 words.
 3. Directly attack one specific claim from the user argument.
-4. Add one concrete reason/example or causal explanation.
-5. End with one sharp challenge question or pressure point.
-6. Never agree with the user and never use meta-talk.
-7. Match the user's language style (English/Hinglish/Hindi mix) if detectable.
+4. Mention the topic phrase "${topic}" at least once in the response if it fits naturally.
+5. Sound like the second person in a simple debate sample, not a long essay.
+6. Add one concrete reason/example or causal explanation.
+7. Never agree with the user and never use meta-talk.
+8. Match the user's language style (English/Hinglish/Hindi mix) if detectable.
+${responseStyleInstruction}
 
 Return only the rebuttal text.`;
 
@@ -658,9 +699,9 @@ Return only the rebuttal text.`;
       console.log(`[getAIResponse] Calling NVIDIA for turn ${debateContext ? debateContext.length : 1}`);
       
       const response = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel, {
-        systemPrompt: 'You are an elite debate opponent in a live voice debate. Be assertive, logically sharp, and context-aware. Rebut arguments directly, avoid agreement language, and sound like real human debate speech. Never output planning notes, bullet points, JSON, or role labels.',
-        maxTokens: 220,
-        temperature: 0.75,
+        systemPrompt: 'You are the second speaker in a back-and-forth sample debate. Be concise, natural, and directly disagree with the user\'s last point. Sound like a real debate partner, not a polished essay writer. Never output planning notes, bullet points, JSON, or role labels.',
+        maxTokens: 120,
+        temperature: 0.6,
         topP: 0.95,
         presencePenalty: 0.4,
         frequencyPenalty: 0.35
@@ -672,6 +713,22 @@ Return only the rebuttal text.`;
         aiResponse = aiResponse.replace(/^(AI:|Response:|Counter-Argument:|Argument:)/i, "").trim();
         aiResponse = aiResponse.replace(/^["']+(.*?)["']+$/g, '$1').trim();
         aiResponse = aiResponse.replace(/\s{2,}/g, ' ').trim();
+
+        const aiWordCount = aiResponse.split(/\s+/).filter(Boolean).length;
+        const responseTopicRelevance = calculateKeywordRelevance(aiResponse, topicKeywords);
+        const claimKeywords = extractKeywords(userArgument, 5).slice(0, 6);
+        const claimRelevance = calculateKeywordRelevance(aiResponse, claimKeywords);
+
+        // Hard guardrail: if response is too short or drifts from topic/claim, use deterministic topic-locked fallback.
+        if (aiWordCount < 20 || aiWordCount > 60 || responseTopicRelevance < 0.2 || claimRelevance < 0.15) {
+          console.warn('[getAIResponse] Response quality guardrail triggered:', {
+            aiWordCount,
+            responseTopicRelevance,
+            claimRelevance
+          });
+          aiResponse = buildTopicLockedFallbackResponse(userArgument, topic, argumentInsights);
+          engineUsed = 'topic-locked-fallback';
+        }
       } else {
         throw new Error("Empty response from LLM");
       }
@@ -704,7 +761,9 @@ Return only the rebuttal text.`;
     
     // Simple emergency response - ensure "topic" is available from the request if possible
     const currentTopic = req.body.topic || "this topic";
-    const emergencyResponse = `I see your point, but I think differently about "${currentTopic}". Let me explain why my view makes more sense.`;
+    const fallbackUserClaim = String(req.body.userArgument || '').trim();
+    const emergencyInsights = analyzeDebateArgument(fallbackUserClaim, currentTopic, Array.isArray(req.body.debateContext) ? req.body.debateContext : []);
+    const emergencyResponse = buildTopicLockedFallbackResponse(fallbackUserClaim, currentTopic, emergencyInsights);
     
     res.json({
       success: true,

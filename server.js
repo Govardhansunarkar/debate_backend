@@ -1,12 +1,19 @@
 const express = require('express');
-const { db, isFirebaseReady, firebaseInitError } = require("./firebase");
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 require('dotenv').config();
 
+// MongoDB setup
+const { connectDB, getDBStatus } = require('./db');
+const MongoUser = require('./models/User');
+
+// In-memory fallback
+const { User, users } = require('./models/index');
+
 const app = express();
 const server = http.createServer(app);
+const savedPayloads = [];
 
 // Build CORS origins dynamically
 const corsOrigins = [
@@ -21,15 +28,26 @@ const corsOrigins = [
   'https://debate-frontend-paro.vercel.app'
 ];
 
-// Add production domains from env
-if (process.env.FRONTEND_URL) {
-  corsOrigins.push(process.env.FRONTEND_URL.trim());
-}
+const addOriginsFromEnv = (value) => {
+  if (!value) return;
+  value
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .forEach((origin) => corsOrigins.push(origin));
+};
 
-// Add local URL from env if exists
-if (process.env.FRONTEND_URL_LOCAL) {
-  corsOrigins.push(process.env.FRONTEND_URL_LOCAL.trim());
-}
+// Add production and local domains from env (supports comma-separated URLs)
+addOriginsFromEnv(process.env.FRONTEND_URL);
+addOriginsFromEnv(process.env.FRONTEND_URL_LOCAL);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (corsOrigins.includes(origin)) return true;
+
+  // Allow Vercel preview/production domains for the frontend app
+  return /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
+};
 
 console.log('🔐 CORS Origins Configured:', corsOrigins);
 console.log('🔐 NODE_ENV:', process.env.NODE_ENV);
@@ -39,8 +57,12 @@ const io = socketIo(server, {
   transports: ['websocket', 'polling'],  // Prioritize WebSocket, fallback to polling
   cors: {
     origin: (origin, callback) => {
-      // Allow all development origins for stability during fix
-      callback(null, true);
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        console.warn('❌ Socket CORS rejected origin:', origin);
+        callback(new Error('Not allowed by CORS'));
+      }
     },
     methods: ['GET', 'POST'],
     credentials: true,
@@ -60,7 +82,7 @@ const io = socketIo(server, {
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin || corsOrigins.includes(origin)) {
+    if (isAllowedOrigin(origin)) {
       callback(null, true);
     } else {
       console.warn('❌ CORS rejected origin:', origin);
@@ -72,6 +94,14 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Security headers for cross-origin communication
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
+
 app.use(express.json());
 
 // Setup PeerJS Server using ExpressPeerServer (runs on same port as Express)
@@ -111,39 +141,51 @@ app.use('/api/rooms', roomRoutes);
 app.use('/api/debates', debateRoutes);
 app.use('/api/users', userRoutes);
 
-// Health check
+// Health check with DB status
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', message: 'AI Debate Arena API is running' });
+  res.json({ 
+    status: 'healthy', 
+    message: 'AI Debate Arena API is running',
+    database: getDBStatus()
+  });
 });
 
 app.get('/', (req, res) => {
   res.json({ message: 'Welcome to AI Debate Arena API' });
 });
 
-const ensureFirebase = (res) => {
-  if (!isFirebaseReady || !db) {
-    return res.status(503).json({
-      success: false,
-      error: 'Firebase is not configured on server',
-      details: firebaseInitError ? firebaseInitError.message : 'Missing Firebase credentials'
-    });
-  }
-  return null;
+const upsertUserFromLogin = ({ uid, email, displayName, photoURL }) => {
+  const userId = uid || `user_${Date.now()}`;
+  const existingUser = users.get(userId);
+  const user = existingUser || new User(displayName || 'Anonymous');
+
+  user.id = userId;
+  user.name = displayName || user.name || 'Anonymous';
+  user.avatar = photoURL || user.avatar;
+  user.email = email || user.email || null;
+  user.photoURL = photoURL || user.photoURL || null;
+  user.lastLogin = new Date().toISOString();
+
+  users.set(userId, user);
+  return user;
 };
 
-// 👇 YE IMPORTANT HAI
+// Store incoming payloads locally in memory.
 app.post("/save", async (req, res) => {
   try {
-    const firebaseErrorResponse = ensureFirebase(res);
-    if (firebaseErrorResponse) return;
-
     const data = req.body; // jo data frontend se aayega
 
     console.log("Data received:", data); // check karne ke liye
 
-    await db.collection("debates").add(data); // Firebase me save
+    const savedRecord = {
+      id: `payload_${Date.now()}`,
+      data,
+      savedAt: new Date().toISOString()
+    };
 
-    res.send("Data saved successfully 🚀");
+    savedPayloads.push(savedRecord);
+
+    res.json({ success: true, message: "Data saved in memory", record: savedRecord });
   } catch (error) {
     console.log(error);
     res.status(500).send("Error saving data");
@@ -155,33 +197,119 @@ app.get("/save", (req, res) => {
   res.send("Please use POST method from Postman or Frontend to save data. This route is working! ✅");
 });
 
-// 👇 Google Login के बाद User का डेटा 'users' कलेक्शन में सेव करने के लिए
+// Persist login details to MongoDB and in-memory fallback.
 app.post("/api/users/login", async (req, res) => {
   try {
-    const firebaseErrorResponse = ensureFirebase(res);
-    if (firebaseErrorResponse) return;
+    console.log('\n🔍 [LOGIN REQUEST] Received:', {
+      body: req.body,
+      headers: { 'content-type': req.get('content-type') }
+    });
 
     const { uid, email, displayName, photoURL } = req.body;
+    const normalizedEmail = (email || '').trim().toLowerCase();
+
+    console.log(`📝 Parsed data: uid=${uid}, email=${email}, displayName=${displayName}`);
 
     if (!uid) {
-      return res.status(400).send("User ID is required");
+      console.error('❌ Missing uid in request body');
+      return res.status(400).json({ success: false, error: "User ID is required" });
     }
 
-    console.log("Saving user:", displayName, email);
+    if (!normalizedEmail) {
+      console.error('❌ Missing email in request body');
+      return res.status(400).json({ success: false, error: "Email is required" });
+    }
 
-    // .set() का इस्तेमाल 'merge: true' के साथ ताकि बार-बार लॉगिन करने पर डेटा ओवरराइट न हो, बस अपडेट हो
-    await db.collection("users").doc(uid).set({
-      uid,
-      email,
-      displayName,
-      photoURL,
-      lastLogin: new Date().toISOString()
-    }, { merge: true });
+    let savedUser = null;
+    let source = 'in-memory';
 
-    res.send("User authenticated and data stored successfully! 👤✅");
+    // Try to save to MongoDB first
+    try {
+      const dbStatus = getDBStatus();
+      console.log(`🗄️ DB Status:`, dbStatus);
+
+      if (dbStatus.connected) {
+        console.log(`🔍 Upserting user by uid/email: uid=${uid}, email=${normalizedEmail}`);
+
+        const now = new Date();
+        const selector = { $or: [{ uid }, { email: normalizedEmail }] };
+        const update = {
+          $set: {
+            uid,
+            email: normalizedEmail,
+            displayName,
+            photoURL: photoURL || null,
+            lastLogin: now,
+            updatedAt: now
+          },
+          $setOnInsert: {
+            createdAt: now
+          }
+        };
+
+        let mongoUser;
+        try {
+          mongoUser = await MongoUser.findOneAndUpdate(selector, update, {
+            new: true,
+            upsert: true,
+            runValidators: true,
+            setDefaultsOnInsert: true
+          });
+        } catch (dupErr) {
+          // Rare race condition guard: retry by email document id.
+          if (dupErr && dupErr.code === 11000) {
+            const existingByEmail = await MongoUser.findOne({ email: normalizedEmail });
+            if (existingByEmail) {
+              mongoUser = await MongoUser.findByIdAndUpdate(
+                existingByEmail._id,
+                update,
+                { new: true, runValidators: true }
+              );
+            } else {
+              throw dupErr;
+            }
+          } else {
+            throw dupErr;
+          }
+        }
+
+        savedUser = mongoUser;
+        source = 'MongoDB';
+        console.log(`✅ User upserted in MongoDB: ${normalizedEmail}`);
+      } else {
+        console.warn(`⚠️ MongoDB not connected`);
+      }
+    } catch (mongoError) {
+      console.error(`❌ MongoDB Error:`, mongoError.message);
+      console.error(`Stack:`, mongoError.stack);
+    }
+
+    // Fallback to in-memory storage
+    if (!savedUser) {
+      console.log(`📦 Falling back to in-memory storage`);
+      const user = upsertUserFromLogin({ uid, email, displayName, photoURL });
+      savedUser = user;
+    }
+
+    const response = {
+      success: true,
+      message: `User authenticated and stored (${source})`,
+      user: {
+        id: savedUser.uid || savedUser.id,
+        name: savedUser.displayName || savedUser.name,
+        email: savedUser.email,
+        avatar: savedUser.photoURL || savedUser.avatar,
+        lastLogin: savedUser.lastLogin,
+        source
+      }
+    };
+
+    console.log(`✅ Sending login response:`, response);
+    res.json(response);
   } catch (error) {
-    console.error("User save error:", error);
-    res.status(500).send("Error saving user data");
+    console.error("❌ User save error:", error.message);
+    console.error("Stack:", error.stack);
+    res.status(500).json({ success: false, error: "Error saving user data", details: error.message });
   }
 });
 
@@ -196,10 +324,17 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = parseInt(process.env.PORT || 3001, 10);
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 AI Debate Arena Server running on port ${PORT}`);
-  console.log(`📡 Socket.IO available at ws://localhost:${PORT}/socket.io/`);
-  console.log(`✅ CORS enabled for: http://localhost:5173, http://localhost:5174`);
-});
+
+// Initialize MongoDB connection before starting server
+(async () => {
+  await connectDB();
+  
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 AI Debate Arena Server running on port ${PORT}`);
+    console.log(`📡 Socket.IO available at ws://localhost:${PORT}/socket.io/`);
+    console.log(`✅ CORS enabled for: http://localhost:5173, http://localhost:5174`);
+    console.log(`📊 Database Status:`, getDBStatus());
+  });
+})();
 
 module.exports = { app, io };
