@@ -28,12 +28,163 @@ const calculateKeywordRelevance = (text, keywords = []) => {
   return matched / uniqueKeywords.length;
 };
 
-const buildTopicLockedFallbackResponse = (userArgument, topic, argumentInsights) => {
-  const claimSnippet = String(userArgument || '').trim().slice(0, 140) || `your position on ${topic}`;
-  const strongestClaim = argumentInsights?.claims?.[0] || claimSnippet;
-  const strategyHint = argumentInsights?.strategy?.techniques?.[0] || 'causal weakness';
+const cleanLlmText = (text) => String(text || '')
+  .replace(/```(?:json)?/gi, '')
+  .replace(/```/g, '')
+  .replace(/\r/g, '')
+  .trim();
 
-  return `But "${strongestClaim}" still misses the key trade-off in ${topic}, so the point is not fully convincing. If it is really strong, explain why it still holds when the practical consequences and counter-evidence are pushed hard.`;
+const extractSectionedAnalysis = (text) => {
+  const cleaned = cleanLlmText(text);
+  const sections = {
+    overall_score: 0,
+    summary: cleaned,
+    strengths: [],
+    weaknesses: [],
+    recommendations: []
+  };
+
+  const readSection = (label, nextLabels = []) => {
+    const labelRegex = new RegExp(`(?:^|\n)\s*${label}\s*:\s*`, 'i');
+    const labelMatch = cleaned.match(labelRegex);
+    if (!labelMatch || labelMatch.index === undefined) return '';
+
+    const startIndex = labelMatch.index + labelMatch[0].length;
+    const remainder = cleaned.slice(startIndex);
+
+    let endIndex = remainder.length;
+    nextLabels.forEach((nextLabel) => {
+      const nextRegex = new RegExp(`(?:^|\n)\s*${nextLabel}\s*:\s*`, 'i');
+      const nextMatch = remainder.match(nextRegex);
+      if (nextMatch && nextMatch.index !== undefined && nextMatch.index < endIndex) {
+        endIndex = nextMatch.index;
+      }
+    });
+
+    return remainder.slice(0, endIndex).trim();
+  };
+
+  const toList = (value) => String(value || '')
+    .split(/\n+/)
+    .map((line) => line.replace(/^[-*•\d.)\s]+/, '').trim())
+    .filter((line) => {
+      if (!line) return false;
+      const lower = line.toLowerCase();
+      return !lower.startsWith('we need to') &&
+        !lower.startsWith('let\'s') &&
+        !lower.startsWith('topic:') &&
+        !lower.startsWith('debate:') &&
+        !lower.startsWith('return only') &&
+        !lower.startsWith('overall score') &&
+        !lower.startsWith('summary:') &&
+        !lower.startsWith('strengths:') &&
+        !lower.startsWith('weaknesses:') &&
+        !lower.startsWith('recommendations:') &&
+        !/^item\s*\d+$/i.test(lower) &&
+        !/^specific observation\s*\d+$/i.test(lower);
+    })
+    .slice(0, 5);
+
+  const scoreMatch = cleaned.match(/Overall\s*Score\s*:\s*(\d+(?:\.\d+)?)/i) || cleaned.match(/Score\s*:\s*(\d+(?:\.\d+)?)/i);
+  if (scoreMatch?.[1]) {
+    sections.overall_score = Math.max(0, Math.min(10, Number(scoreMatch[1])));
+  }
+
+  const summary = readSection('Summary', ['Strengths', 'Weaknesses', 'Recommendations', 'Improvement', 'Improvements']);
+  const strengths = readSection('Strengths', ['Weaknesses', 'Recommendations', 'Improvement', 'Improvements']);
+  const weaknesses = readSection('Weaknesses', ['Recommendations', 'Improvement', 'Improvements']);
+  const recommendations = readSection('Recommendations', ['Improvement', 'Improvements']);
+
+  if (summary) sections.summary = summary;
+  sections.strengths = toList(strengths);
+  sections.weaknesses = toList(weaknesses);
+  sections.recommendations = toList(recommendations);
+
+  if (!sections.strengths.length && cleaned) {
+    const positiveLine = cleaned.split(/\n+/).find((line) => {
+      const lower = line.toLowerCase();
+      return !lower.startsWith('we need to') && /\b(clarity|logic|engage|strong|good|effective|clear|specific)\b/i.test(line);
+    });
+    if (positiveLine) sections.strengths = [positiveLine.trim()];
+  }
+
+  if (!sections.weaknesses.length && cleaned) {
+    const improvementLine = cleaned.split(/\n+/).find((line) => {
+      const lower = line.toLowerCase();
+      return !lower.startsWith('we need to') && /\b(improve|better|more|could|should|need|lacks|weak|tighten)\b/i.test(line);
+    });
+    if (improvementLine) sections.weaknesses = [improvementLine.trim()];
+  }
+
+  if (!sections.recommendations.length && cleaned) {
+    sections.recommendations = sections.weaknesses.slice(0, 2);
+  }
+
+  return sections;
+};
+
+const extractDebateRebuttal = (text) => {
+  const cleaned = cleanLlmText(text);
+  if (!cleaned) return '';
+
+  const exampleMatch = cleaned.match(/(?:example|e\.g\.)\s*:\s*"?([^"\n]{20,320})/i);
+  if (exampleMatch?.[1]) {
+    const exampleLine = exampleMatch[1].trim();
+    if (exampleLine.length >= 20) {
+      return exampleLine;
+    }
+  }
+
+  const egCounterpointMatch = cleaned.match(/counterpoint\s*\(\s*e\.g\.,?\s*([^\)\n]{20,280})\)/i);
+  if (egCounterpointMatch?.[1]) {
+    const egLine = egCounterpointMatch[1].trim();
+    if (egLine.length >= 20) {
+      return egLine;
+    }
+  }
+
+  const sentenceMatch = cleaned.match(/sentence\s*:\s*"?([^"\n]{20,320})/i);
+  if (sentenceMatch?.[1]) {
+    const sentenceLine = sentenceMatch[1].trim();
+    if (sentenceLine.length >= 20) {
+      return sentenceLine;
+    }
+  }
+
+  const craftMatch = cleaned.match(/let'?s\s+craft\s*:\s*"?([^\n]{20,320})/i);
+  if (craftMatch?.[1]) {
+    const crafted = craftMatch[1].trim();
+    if (crafted.length >= 20) {
+      return crafted;
+    }
+  }
+
+  const quotedMatches = [...cleaned.matchAll(/"([^"\n]{12,260})"/g)];
+  if (quotedMatches.length > 0) {
+    const quoted = quotedMatches
+      .map((match) => match[1].trim())
+      .filter((value) => value.length >= 12)
+      .sort((a, b) => b.length - a.length)[0];
+    if (quoted) return quoted;
+  }
+
+  const openEndedQuote = cleaned.match(/"([^"\n]{20,320})$/m);
+  if (openEndedQuote?.[1]) {
+    return openEndedQuote[1].trim();
+  }
+
+  const sentenceMatches = cleaned.match(/[^.!?]+[.!?]?/g) || [];
+  const filteredSentences = sentenceMatches
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 12)
+    .filter((part) => !/^(we need to|let'?s|word count|count:|example:|sentence:|response requirements|topic:|current user argument:)/i.test(part))
+    .filter((part) => !/(we need to|must be|output only|no labels|no bullets|instruction text|count words)/i.test(part));
+
+  if (filteredSentences.length > 0) {
+    return filteredSentences.sort((a, b) => b.length - a.length)[0];
+  }
+
+  return cleaned;
 };
 
 // =====================================================
@@ -106,6 +257,10 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model, options = {}) => {
 
       // If none of those, try reasoning
       if (!text && message.reasoning) text = message.reasoning.trim();
+
+      if (options.returnRaw === true) {
+        return text;
+      }
 
       // CLEANING: Extract only the core response from the LLM output
       // Handle the common pattern of <thought> blocks or meta-text
@@ -199,9 +354,14 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model, options = {}) => {
 
       // Safety check: ensure no garbage remains
       if (aiResponse.includes("Words:") || aiResponse.includes("Total =")) {
-          // Harsh fallback if cleaning fails - try to find a sentence that doesn't look like planning
+          // If cleaning fails, keep only a valid sentence or fail so caller gets an explicit LLM error.
           const sentences = aiResponse.split(/[.!?]+/);
-          aiResponse = sentences.find(s => !s.toLowerCase().includes('word') && s.trim().length > 10) || "I disagree with your point.";
+          const cleanedCandidate = sentences.find(s => !s.toLowerCase().includes('word') && s.trim().length > 10);
+          if (cleanedCandidate) {
+            aiResponse = `${cleanedCandidate.trim()}.`;
+          } else {
+            throw new Error('Unusable LLM response after cleaning');
+          }
       }
 
       console.log('[NVIDIA] ✅ Response received successfully');
@@ -409,8 +569,9 @@ exports.analyzeWithOpenAI = async (req, res) => {
 
     // ⚡ OPTIMIZED: Create a cache key for this debate's speeches
     const crypto = require('crypto');
+    const feedbackPromptVersion = 'v2';
     const speechHash = crypto.createHash('md5').update(JSON.stringify(speeches) + topic).digest('hex').substring(0, 8);
-    const cacheKey = `feedback_${speechHash}`;
+    const cacheKey = `feedback_${feedbackPromptVersion}_${speechHash}`;
     
     // Check if we have cached feedback
     const feedbackCache = global.feedbackCache || {};
@@ -425,8 +586,8 @@ exports.analyzeWithOpenAI = async (req, res) => {
     }
     if (!global.feedbackCache) global.feedbackCache = {};
 
-    // ⚡ OPTIMIZED: Use shorter, faster prompt for quicker LLM response
-    const feedbackPrompt = `Topic: ${topic}\nDebate (${speeches.length} turns):\n${speechText}\n\nReturn JSON: {"overall_score": 1-10, "summary": "1 sentence", "strengths": [2 items], "weaknesses": [2 items], "recommendations": [2 items]}`;
+    // Ask the LLM for a strict sectioned format that is easier to parse reliably.
+    const feedbackPrompt = `Analyze this debate and return ONLY the following sections, with no markdown and no extra text. Every bullet must be specific to the transcript, not generic. Do NOT use placeholder words like item1/item2.\n\nOverall Score: 1-10\nSummary: 1-2 sentences\nStrengths:\n- specific observation 1\n- specific observation 2\nWeaknesses:\n- specific observation 1\n- specific observation 2\nRecommendations:\n- specific observation 1\n- specific observation 2\n\nTopic: ${topic}\nDebate (${speeches.length} turns):\n${speechText}`;
 
     // Construct proper endpoint URL
     const endpoint = `${nvidiaApiUrl.replace(/\/chat\/completions$/, '')}/chat/completions`;
@@ -460,9 +621,7 @@ exports.analyzeWithOpenAI = async (req, res) => {
       throw new Error('No analysis text from NVIDIA');
     }
 
-    // Clean JSON if needed (remove markdown blocks)
-    const cleanedJson = analysisText.replace(/```json|```/g, '').trim();
-    let analysis = JSON.parse(cleanedJson);
+    const analysis = extractSectionedAnalysis(analysisText);
     
     // ⚡ Cache the result for future identical debates
     global.feedbackCache[cacheKey] = {
@@ -478,22 +637,11 @@ exports.analyzeWithOpenAI = async (req, res) => {
     });
   } catch (error) {
     console.error('[analyzeWithOpenAI] ❌ FAST ANALYSIS FAILED:', error.message);
-    
-    // IMMEDIATE FALLBACK (within 100ms) - No long waiting
-    const fallbackAnalysis = {
-      overall_score: 7,
-      summary: "Great effort in the debate! Your points were clear.",
-      strengths: ["Clear articulation", "Maintained focus on topic"],
-      weaknesses: ["Could use more data", "Counter-arguments need more depth"],
-      key_points: ["Arguments based on general logic"],
-      recommendations: ["Try adding statistics", "Focus on opponent weaknesses"]
-    };
 
-    res.json({ 
-      success: true, 
-      analysis: fallbackAnalysis,
-      source: 'FALLBACK_FAST',
-      warning: "Real-time AI analysis busy, providing immediate baseline feedback."
+    return res.status(502).json({ 
+      success: false, 
+      error: 'LLM analysis unavailable',
+      details: error.message
     });
   }
 };
@@ -516,61 +664,13 @@ exports.analyzeWithGemini = async (req, res) => {
       return res.status(400).json({ success: false, error: "Topic is required" });
     }
 
-    // Since we're using NVIDIA LLM exclusively now, return success
-    // The analyzeWithOpenAI function (which uses NVIDIA) is the primary feedback engine
-    res.json({ 
-      success: true, 
-      analysis: null, // Frontend will use OpenAI analysis (which is actually NVIDIA LLM)
-      note: "Using primary LLM feedback analysis" 
+    return res.status(501).json({
+      success: false,
+      error: 'Gemini endpoint is disabled. Use analyze-openai for NVIDIA LLM feedback.'
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
-};
-
-// Helper function to generate intelligent fallback responses based on debate context
-const generateIntelligentFallback = (userArgument, topic, debateContext) => {
-  const debateHistoryCount = debateContext ? debateContext.length : 0;
-  
-  // Analyze user argument for key topics
-  const argWords = userArgument.toLowerCase().split(/\s+/);
-  
-  // Strategy-based responses that actually reference counterpoints
-  const strategicResponses = {
-    early: [
-      "I understand your perspective on this, but data shows that actually works against your argument.",
-      "That's a common misconception. Let me explain why the evidence contradicts that point.",
-      "I see the logic, but you haven't addressed the core issue: the practical implementation challenges.",
-      "Your argument overlooks a critical detail that changes the entire outcome.",
-      "While that sounds logical, real-world examples demonstrate the opposite effect."
-    ],
-    middle: [
-      "You make a valid attempt, but my earlier point about [the fundamental challenge] directly contradicts that.",
-      "Building on what I said before, this actually strengthens my position even further.",
-      "I appreciate the effort, but that doesn't address my core concern about feasibility.",
-      "That argument fails because it ignores the systemic issues I raised.",
-      "You're making an assumption that I've already proven false in earlier statements."
-    ],
-    late: [
-      "After all the evidence we've discussed, your position still doesn't hold up to scrutiny.",
-      "Your argument is contradicted by the multiple points I've already established.",
-      "This doesn't change the fundamental weakness in your position that I've highlighted.",
-      "You're repeating an argument I've already dismantled with concrete evidence.",
-      "Your conclusion ignores all the counterpoints I've systematically presented."
-    ]
-  };
-
-  // Pick response based on debate stage
-  let responses;
-  if (debateHistoryCount < 3) {
-    responses = strategicResponses.early;
-  } else if (debateHistoryCount < 7) {
-    responses = strategicResponses.middle;
-  } else {
-    responses = strategicResponses.late;
-  }
-
-  return responses[Math.floor(Math.random() * responses.length)];
 };
 
 // Get AI Response to user's argument - WITH STREAMING & TOPIC ENFORCEMENT
@@ -659,79 +759,289 @@ exports.getAIResponse = async (req, res) => {
         9. Keep tone assertive but debate-safe (no abuse, no slurs).`
           : `8. Reply like the next line in a sample back-and-forth debate and stay tightly tied to the latest user claim.`;
 
-    const prompt = `You are in a real-time live debate round.
-
-Debate Topic: "${topic}"
-Turn Number: ${turnNumber}
-Current User Argument: "${userArgument}"
-
-Recent Transcript:
-${conversationHistory}
-
-User Speech Signals:
-- Transcript source: ${transcriptSource}
-- User words: ${wordCount}
-- Approx speech duration (sec): ${speechDuration || 'unknown'}
-- Estimated pace (wpm): ${speechPace || 'unknown'} (${speechPaceBand})
-
-Argument Analysis Signals:
-- Claims: ${argumentInsights.claims?.slice(0, 3).join(' | ') || 'none'}
-- Strength tags: ${(argumentInsights.strength?.analysis || []).join(', ') || 'none'}
-- Counter strategy: ${argumentInsights.strategy?.techniques?.slice(0, 3).join(', ') || 'challenge assumptions'}
-
-Response requirements:
-1. Write a natural rebuttal like a real debate opponent, not a chatbot.
-2. Use only 1-2 sentences, around 25-45 words.
-3. Directly attack one specific claim from the user argument.
-4. Mention the topic phrase "${topic}" at least once in the response if it fits naturally.
-5. Sound like the second person in a simple debate sample, not a long essay.
-6. Add one concrete reason/example or causal explanation.
-7. Never agree with the user and never use meta-talk.
-8. Match the user's language style (English/Hinglish/Hindi mix) if detectable.
-${responseStyleInstruction}
-
-Return only the rebuttal text.`;
+    const prompt = `Topic: ${topic}\nCurrent claim: ${userArgument}\nRecent transcript:\n${conversationHistory}\n\nWrite only one natural counterpoint as the opposing debater. Use 1-2 sentences, 25-45 words. Attack one specific claim and give one concrete reason/example. Do not repeat the user's sentence. Do not add labels, analysis, or instructions.`;
 
     let aiResponse = "";
     let engineUsed = 'nvidia';
+
+    const sanitizeCandidate = (text) => {
+      if (!text) return '';
+      return String(text)
+        .replace(/^(AI:|Response:|Counter-Argument:|Argument:)/i, '')
+        .replace(/^(e\.g\.,?|example\s*:)/i, '')
+        .replace(/^(Opposing\s*:|Counterpoint\s*:|Reason\s*:)/gi, '')
+        .replace(/\b(Opposing\s*:|Counterpoint\s*:|Reason\s*:)/gi, '')
+        .replace(/let'?s count:?/gi, '')
+        .replace(/\b([A-Za-z]+)\((\d+)\)/g, '$1')
+        .replace(/\b([A-Za-z]+)(\d+)\b/g, '$1')
+        .replace(/^["']+(.*?)["']+$/g, '$1')
+        .replace(/["']+$/g, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    };
+
+    const looksTruncated = (text) => {
+      const value = String(text || '').trim();
+      if (!value) return true;
+      const words = value.split(/\s+/).filter(Boolean).length;
+      if (words < 10) return true;
+      if (/[.!?]$/.test(value)) return false;
+      return /\b(and|or|to|with|for|of|that|which|a|an|the|work|life|more|less|because|as|by|from|in|on|at|than|while|when|who|why)\s*$/i.test(value);
+    };
+
+    const finalizeCandidate = (text) => {
+      let value = sanitizeCandidate(text);
+      if (!value) return '';
+
+      const trailingConnectors = new Set([
+        'and', 'or', 'to', 'with', 'for', 'of', 'that', 'which', 'a', 'an', 'the', 'as', 'by', 'from', 'in', 'on', 'at', 'than', 'while', 'when', 'who', 'why', 'because', 'compared', 'more', 'less'
+      ]);
+
+      let tokens = value.split(/\s+/).filter(Boolean);
+      while (tokens.length > 10) {
+        const tail = tokens[tokens.length - 1].toLowerCase().replace(/[^a-z0-9%]/g, '');
+        if (!trailingConnectors.has(tail)) break;
+        tokens.pop();
+      }
+
+      while (tokens.length > 10) {
+        const rawTail = tokens[tokens.length - 1];
+        const cleanTail = rawTail.toLowerCase().replace(/[^a-z0-9%]/g, '');
+        const malformedTail = cleanTail.length <= 2 || /[\u2010\u2011\u2012\u2013\u2014\u2015-]$/.test(rawTail) || /[\u2010\u2011\u2012\u2013\u2014\u2015-][^\s]*$/.test(rawTail);
+        if (!malformedTail) break;
+        tokens.pop();
+      }
+
+      value = tokens.join(' ').replace(/\s{2,}/g, ' ').trim();
+      if (value && !/[.!?]$/.test(value)) {
+        value = `${value}.`;
+      }
+      return value;
+    };
+
+    const hasMetaLeak = (text) => {
+      const lower = String(text || '').toLowerCase();
+      return (
+        lower.includes('first draft') ||
+        lower.includes('meta talk') ||
+        lower.includes('generic advice') ||
+        lower.includes('return only') ||
+        lower.includes('response requirements') ||
+        lower.includes('user speech signals') ||
+        lower.includes('argument analysis signals') ||
+        lower.includes('rewrite the answer') ||
+        lower.includes('you are the user') ||
+        lower.includes('we are the user') ||
+        lower.includes("let's count") ||
+        lower.includes('word count') ||
+        lower.includes('count:') ||
+        lower.startsWith('count ') ||
+        lower.includes(' count ') ||
+        lower.includes('we need') ||
+        lower.includes('let\'s craft') ||
+        lower.includes('example:') ||
+        lower.includes('sentence:') ||
+        /\b[a-z]+\(\d+\)/i.test(lower) ||
+        /\b[a-z]+\d+\b/i.test(lower)
+      );
+    };
     
     try {
       console.log(`[getAIResponse] Calling NVIDIA for turn ${debateContext ? debateContext.length : 1}`);
       
-      const response = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel, {
-        systemPrompt: 'You are the second speaker in a back-and-forth sample debate. Be concise, natural, and directly disagree with the user\'s last point. Sound like a real debate partner, not a polished essay writer. Never output planning notes, bullet points, JSON, or role labels.',
-        maxTokens: 120,
-        temperature: 0.6,
-        topP: 0.95,
-        presencePenalty: 0.4,
-        frequencyPenalty: 0.35
-      });
-      
-      if (response && response.length > 5) {
-        aiResponse = response.trim();
-        // Clean any residual meta-text
-        aiResponse = aiResponse.replace(/^(AI:|Response:|Counter-Argument:|Argument:)/i, "").trim();
-        aiResponse = aiResponse.replace(/^["']+(.*?)["']+$/g, '$1').trim();
-        aiResponse = aiResponse.replace(/\s{2,}/g, ' ').trim();
+      const claimKeywords = extractKeywords(userArgument, 5).slice(0, 6);
+      const normalizeForCompare = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const normalizedUserArgument = normalizeForCompare(userArgument);
+      const normalizedRecentUserClaims = normalizedContext
+        .filter((item) => String(item?.speaker || '').toLowerCase() !== 'ai')
+        .map((item) => normalizeForCompare(item?.text || ''))
+        .filter(Boolean)
+        .slice(-6);
+      const echoPool = [...new Set([normalizedUserArgument, ...normalizedRecentUserClaims].filter(Boolean))];
 
-        const aiWordCount = aiResponse.split(/\s+/).filter(Boolean).length;
-        const responseTopicRelevance = calculateKeywordRelevance(aiResponse, topicKeywords);
-        const claimKeywords = extractKeywords(userArgument, 5).slice(0, 6);
-        const claimRelevance = calculateKeywordRelevance(aiResponse, claimKeywords);
+      const tokenOverlap = (a, b) => {
+        const aTokens = new Set(String(a || '').split(/\s+/).filter((t) => t.length > 2));
+        const bTokens = new Set(String(b || '').split(/\s+/).filter((t) => t.length > 2));
+        if (!aTokens.size || !bTokens.size) return 0;
+        const intersection = [...aTokens].filter((t) => bTokens.has(t)).length;
+        const union = new Set([...aTokens, ...bTokens]).size;
+        return union === 0 ? 0 : intersection / union;
+      };
 
-        // Hard guardrail: if response is too short or drifts from topic/claim, use deterministic topic-locked fallback.
-        if (aiWordCount < 20 || aiWordCount > 60 || responseTopicRelevance < 0.2 || claimRelevance < 0.15) {
-          console.warn('[getAIResponse] Response quality guardrail triggered:', {
-            aiWordCount,
-            responseTopicRelevance,
-            claimRelevance
-          });
-          aiResponse = buildTopicLockedFallbackResponse(userArgument, topic, argumentInsights);
-          engineUsed = 'topic-locked-fallback';
+      const buildNgrams = (value, n = 3) => {
+        const tokens = String(value || '').split(/\s+/).filter((t) => t.length > 2);
+        const grams = [];
+        for (let i = 0; i <= tokens.length - n; i += 1) {
+          grams.push(tokens.slice(i, i + n).join(' '));
         }
-      } else {
-        throw new Error("Empty response from LLM");
+        return grams;
+      };
+
+      const sameLeadingTokens = (a, b, count = 4) => {
+        const aHead = String(a || '').split(/\s+/).filter(Boolean).slice(0, count).join(' ');
+        const bHead = String(b || '').split(/\s+/).filter(Boolean).slice(0, count).join(' ');
+        return aHead.length > 0 && aHead === bHead;
+      };
+
+      const scoreResponse = (text) => {
+        const aiWordCount = text.split(/\s+/).filter(Boolean).length;
+        const responseTopicRelevance = calculateKeywordRelevance(text, topicKeywords);
+        const claimRelevance = calculateKeywordRelevance(text, claimKeywords);
+        const normalizedText = normalizeForCompare(text);
+        const responseTrigrams = new Set(buildNgrams(normalizedText, 3));
+        let maxEchoOverlap = 0;
+        const isEchoingUser = echoPool.some((claim) => {
+          if (!claim) return false;
+          if (normalizedText === claim || normalizedText.startsWith(claim) || claim.startsWith(normalizedText)) {
+            return true;
+          }
+
+          const claimTrigrams = buildNgrams(claim, 3);
+          if (claimTrigrams.length >= 2) {
+            const trigramMatches = claimTrigrams.filter((gram) => responseTrigrams.has(gram)).length;
+            if (trigramMatches >= 2) {
+              return true;
+            }
+          }
+
+          const overlap = tokenOverlap(normalizedText, claim);
+          if (overlap > maxEchoOverlap) maxEchoOverlap = overlap;
+          return overlap >= 0.45 || sameLeadingTokens(normalizedText, claim, 4);
+        });
+        const isAgreeing = /\b(i\s+agree|you\s+are\s+right|you\s+make\s+a\s+good\s+point|exactly)\b/i.test(text);
+        const qualityScore = (claimRelevance * 0.5) + (responseTopicRelevance * 0.3) + (Math.min(aiWordCount, 45) / 45 * 0.2);
+
+        return {
+          aiWordCount,
+          responseTopicRelevance,
+          claimRelevance,
+          maxEchoOverlap,
+          qualityScore,
+          hasMetaLeak: hasMetaLeak(text),
+          isEchoingUser,
+          isAgreeing,
+          needsRetry: aiWordCount < 8 || aiWordCount > 120 || (responseTopicRelevance < 0.03 && claimRelevance < 0.02) || hasMetaLeak(text) || isEchoingUser || isAgreeing
+        };
+      };
+
+      const attemptSpecs = [
+        {
+          prompt,
+          options: {
+            systemPrompt: 'You are a real debate opponent. Output only rebuttal text in 1-2 sentences. No labels, no planning, no counting, no explanations.',
+            maxTokens: 110,
+            temperature: 0.55,
+            topP: 0.9,
+            presencePenalty: 0.5,
+            frequencyPenalty: 0.45,
+            returnRaw: true
+          },
+          engine: 'nvidia'
+        },
+        {
+          prompt: `Debate topic: ${topic}\nUser claim: ${userArgument}\n\nRespond as the opposing debater in exactly 1-2 sentences. Give one direct counterpoint and one reason. Do not repeat the user sentence. Do not write words like Count, Example, Sentence, Topic, or any instruction text.`,
+          options: {
+            systemPrompt: 'Return only a natural rebuttal line. Never include prompt analysis, planning notes, word counts, or labels.',
+            maxTokens: 110,
+            temperature: 0.45,
+            topP: 0.85,
+            presencePenalty: 0.45,
+            frequencyPenalty: 0.5,
+            returnRaw: true
+          },
+          engine: 'nvidia-retry-1'
+        },
+        {
+          prompt: `Topic: ${topic}\nClaim to counter: ${userArgument}\n\nOutput only one concise rebuttal (25-45 words). Directly disagree and provide a concrete causal reason. No bullets. No prefixes. No planning text.`,
+          options: {
+            systemPrompt: 'Debate opponent mode. Output exactly one short counter-argument sentence block, and nothing else.',
+            maxTokens: 95,
+            temperature: 0.35,
+            topP: 0.8,
+            presencePenalty: 0.4,
+            frequencyPenalty: 0.55,
+            returnRaw: true
+          },
+          engine: 'nvidia-retry-2'
+        }
+      ];
+
+      let bestAttempt = null;
+      let bestUsableAttempt = null;
+
+      for (const spec of attemptSpecs) {
+        const raw = await callNvidiaAPI(spec.prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel, spec.options);
+        const extracted = extractDebateRebuttal(raw);
+        let candidate = sanitizeCandidate(extracted);
+
+        // If strict extraction misses, keep a sanitized raw fallback candidate from the same LLM output.
+        if (!candidate) {
+          candidate = sanitizeCandidate(cleanLlmText(raw));
+        }
+
+          if (!candidate) {
+          continue;
+        }
+
+        const quality = scoreResponse(candidate);
+        console.log(`[getAIResponse] Attempt ${spec.engine} candidate:`, candidate);
+        console.log(`[getAIResponse] Attempt ${spec.engine} quality:`, quality);
+        if (!bestAttempt || quality.qualityScore > bestAttempt.quality.qualityScore) {
+          bestAttempt = { candidate, quality, engine: spec.engine };
+        }
+
+        if (!quality.isEchoingUser && !quality.hasMetaLeak && quality.aiWordCount >= 8) {
+          if (!bestUsableAttempt || quality.qualityScore > bestUsableAttempt.quality.qualityScore) {
+            bestUsableAttempt = { candidate, quality, engine: spec.engine };
+          }
+        }
+
+        if (!quality.needsRetry) {
+          aiResponse = candidate;
+          engineUsed = spec.engine;
+          break;
+        }
       }
+
+      if (!aiResponse && bestUsableAttempt) {
+        aiResponse = bestUsableAttempt.candidate;
+        engineUsed = `${bestUsableAttempt.engine}-soft`;
+        console.warn('[getAIResponse] Returning best extracted LLM attempt with soft quality:', bestUsableAttempt.quality);
+      }
+
+      if (aiResponse && looksTruncated(aiResponse)) {
+        try {
+          const repairedRaw = await callNvidiaAPI(
+            `Rewrite this debate rebuttal draft into one complete natural counterpoint sentence (20-40 words). Keep the same meaning, but make it fluent and complete. Output only the final sentence.\n\nDraft: ${aiResponse}`,
+            nvidiaApiKey,
+            nvidiaApiUrl,
+            nvidiaModel,
+            {
+              systemPrompt: 'You rewrite debate rebuttal drafts into one complete sentence. Output only final rebuttal text. No planning or labels.',
+              maxTokens: 90,
+              temperature: 0.25,
+              topP: 0.8,
+              presencePenalty: 0.2,
+              frequencyPenalty: 0.2,
+              returnRaw: true
+            }
+          );
+          const repairedCandidate = sanitizeCandidate(extractDebateRebuttal(repairedRaw));
+          const repairedQuality = scoreResponse(repairedCandidate);
+          if (repairedCandidate && !repairedQuality.hasMetaLeak && !repairedQuality.isEchoingUser && repairedQuality.aiWordCount >= 10) {
+            aiResponse = repairedCandidate;
+            engineUsed = `${engineUsed}-repair`;
+          }
+        } catch (repairError) {
+          console.warn('[getAIResponse] Repair pass failed:', repairError.message);
+        }
+      }
+
+      if (!aiResponse) {
+        throw new Error('LLM response unavailable after 3 attempts');
+      }
+
+      aiResponse = finalizeCandidate(aiResponse);
       
       console.log('[getAIResponse] ✓ Final LLM Response:', aiResponse);
     } catch (apiError) {
@@ -758,18 +1068,11 @@ Return only the rebuttal text.`;
 
   } catch (error) {
     console.error('[getAIResponse] Error:', error);
-    
-    // Simple emergency response - ensure "topic" is available from the request if possible
-    const currentTopic = req.body.topic || "this topic";
-    const fallbackUserClaim = String(req.body.userArgument || '').trim();
-    const emergencyInsights = analyzeDebateArgument(fallbackUserClaim, currentTopic, Array.isArray(req.body.debateContext) ? req.body.debateContext : []);
-    const emergencyResponse = buildTopicLockedFallbackResponse(fallbackUserClaim, currentTopic, emergencyInsights);
-    
-    res.json({
-      success: true,
-      response: emergencyResponse,
-      points: 5,
-      engine: 'emergency-fallback'
+
+    res.status(502).json({
+      success: false,
+      error: 'LLM response unavailable',
+      details: error.message
     });
   }
 };
@@ -936,36 +1239,12 @@ Respond with ONLY valid JSON (no markdown):
 
     } catch (nvidiaError) {
       console.error('[validateTopic] ❌ NVIDIA FAILED:', nvidiaError.message);
-      
-      // Fallback: Use local validation if NVIDIA fails
-      console.warn('[validateTopic] ⚠️ Using fallback local validation');
-      
-      const invalidPatterns = [
-        /^\d+$/,
-        /^[!@#$%^&*()]+$/,
-        /what is your name/i,
-        /who are you/i,
-        /help me/i,
-        /^(help|hack|crack|bypass)/i
-      ];
 
-      const isInvalid = invalidPatterns.some(pattern => pattern.test(trimmedTopic));
-      
-      if (isInvalid) {
-        return res.json({ 
-          success: true, 
-          isValid: false,
-          reason: "This topic is not suitable for debate. Choose a topic with multiple perspectives.",
-          suggestion: "Try topics like: 'Should AI be regulated?', 'Is remote work better?', 'Should we limit social media?'",
-          source: 'LOCAL_FALLBACK'
-        });
-      }
-
-      return res.json({ 
-        success: true, 
-        isValid: true,
-        message: "✅ Topic is valid! You can start debating now.",
-        source: 'LOCAL_FALLBACK'
+      return res.status(502).json({
+        success: false,
+        isValid: false,
+        error: 'Topic validation unavailable',
+        details: nvidiaError.message
       });
     }
 
@@ -1132,42 +1411,13 @@ Return ONLY valid JSON, no markdown:
 
     } catch (llmError) {
       console.error('[analyzeMultiParticipant] ❌ LLM FAILED:', llmError.message);
-      
-      // Fallback: Return individual analysis for each participant
-      console.warn('[analyzeMultiParticipant] ⚠️ FALLING BACK TO TEMPLATE FEEDBACK');
-      
-      const fallbackAnalysis = {
-        topic,
-        participantFeedback: participants.map(p => {
-          const stats = participantStats[p.userId || p.playerName];
-          const baseScore = Math.min(10, 5 + (stats.totalSpeeches || 0));
-          
-          return {
-            playerName: p.playerName,
-            overallScore: baseScore,
-            summary: `Great participation with ${stats.totalSpeeches} speeches and ${stats.totalPoints} points!`,
-            strength: "You participated actively and shared your ideas clearly",
-            improvement: "Consider using more specific examples to support your points",
-            advice: "Next debate, prepare 1-2 concrete examples before you start"
-          };
-        }),
-        debateHighlights: {
-          bestArgument: "This debate had several interesting perspectives on the topic",
-          bestResponseToPoint: "The participants engaged well with each other's points",
-          mostEngaged: participants.length > 0 ? participants[0].playerName : "All participants",
-          keyInsight: "Great debate showing multiple valid perspectives on the topic"
-        },
-        topicInsights: "This was a productive debate where participants explored different angles of the topic."
-      };
-      
-      return res.json({ 
-        success: true, 
-        analysis: fallbackAnalysis,
+
+      return res.status(502).json({ 
+        success: false,
+        error: 'Multi-participant LLM analysis unavailable',
+        details: llmError.message,
         participantCount: participants.length,
-        speechCount: speeches.length,
-        source: 'FALLBACK_TEMPLATE',
-        warning: '⚠️ Using template feedback - LLM unavailable',
-        timestamp: new Date().toISOString()
+        speechCount: speeches.length
       });
     }
 
